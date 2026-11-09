@@ -975,6 +975,23 @@ static void message_loop_n(JNIEnv *env, IjkMediaPlayer *mp)
             MPTRACE("FFP_MSG_VIDEO_DECODER_OPEN: %d\n", msg.arg1);
             post_event(env, weak_thiz, MEDIA_INFO, MEDIA_INFO_VIDEO_DECODER_OPEN, msg.arg1);
             break;
+        case FFP_MSG_SUBTITLE_TEXT: {
+            /* Java's MEDIA_TIMED_TEXT handler only forwards a String, so the
+             * cue timing travels in the payload: "<beginMs>\x01<endMs>\x01<text>". */
+            jstring jtext = NULL;
+            const char *text = (const char *) msg.obj;
+            if (text) {
+                char payload[8192];
+                snprintf(payload, sizeof(payload), "%d%c%d%c%s",
+                         msg.arg1, 0x01, msg.arg2, 0x01, text);
+                jtext = (*env)->NewStringUTF(env, payload);
+            }
+            post_event2(env, weak_thiz, MEDIA_TIMED_TEXT, msg.arg1, msg.arg2, jtext);
+            if (jtext) {
+                (*env)->DeleteLocalRef(env, jtext);
+            }
+            break;
+        }
         case FFP_MSG_AUDIO_SEEK_RENDERING_START:
             MPTRACE("FFP_MSG_AUDIO_SEEK_RENDERING_START:\n");
             post_event(env, weak_thiz, MEDIA_INFO, MEDIA_INFO_AUDIO_SEEK_RENDERING_START, msg.arg1);

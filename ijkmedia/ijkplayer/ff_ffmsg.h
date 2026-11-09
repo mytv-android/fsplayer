@@ -51,7 +51,7 @@
 #define FFP_MSG_BUFFERING_TIME_UPDATE       504     /* arg1 = cached duration in milliseconds, arg2 = high water mark */
 #define FFP_MSG_SEEK_COMPLETE               600     /* arg1 = seek position,                   arg2 = error */
 #define FFP_MSG_PLAYBACK_STATE_CHANGED      700
-//#define FFP_MSG_TIMED_TEXT                  800
+#define FFP_MSG_SUBTITLE_TEXT               800     /* arg1 = begin ms, arg2 = end ms, obj = plain text */
 #define FFP_MSG_SELECTED_STREAM_CHANGED     850     /* stream changed */
 #define FFP_MSG_SELECTING_STREAM_FAILED     851     /* select stream failed */
 #define FFP_MSG_ACCURATE_SEEK_COMPLETE      900     /* arg1 = current position*/

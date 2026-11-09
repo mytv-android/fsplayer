@@ -33,6 +33,10 @@ typedef struct AVFormatContext AVFormatContext;
 typedef struct SDL_TextureOverlay SDL_TextureOverlay;
 typedef struct SDL_GPU SDL_GPU;
 typedef struct AVDictionary AVDictionary;
+typedef void (*ff_sub_text_callback)(void *opaque, double begin, double end, const char *text);
+/* Delivers decoded text subtitle cues (plain text, media time in seconds).
+ * Pass NULL to disable. */
+void ff_sub_set_text_callback(FFSubtitle *sub, ff_sub_text_callback cb, void *opaque);
 // lifecycle
 int ff_sub_init(FFSubtitle **subp, AVDictionary *opts);
 //call in vout thread,because internal fbo and texture were created in vout thread!

@@ -37,6 +37,8 @@ typedef struct FFSubComponent{
     FrameQueue* frameq;
     subComponent_retry_callback retry_callback;
     void *retry_opaque;
+    subComponent_text_callback text_callback;
+    void *text_opaque;
     FF_ASS_Renderer *assRenderer;
     int bitmapRenderer;
     int video_width, video_height;
@@ -299,6 +301,77 @@ static FFSubtitleBuffer* packet_pal8(const AVSubtitleRect* sub)
     return frame;
 }
 
+/* "0:00:01.23" -> seconds; *out_end points past the timestamp. */
+static double parse_ass_timestamp(const char *p, const char **out_end)
+{
+    char *end = NULL;
+    double h = strtod(p, &end);
+    if (end == p || *end != ':') return -1;
+    p = end + 1;
+    double m = strtod(p, &end);
+    if (end == p || *end != ':') return -1;
+    p = end + 1;
+    double s = strtod(p, &end);
+    if (end == p) return -1;
+    if (out_end) *out_end = end;
+    return h * 3600.0 + m * 60.0 + s;
+}
+
+/* ASS dialogue duration from its own Start/End fields; the AVSubtitle times
+ * are usually 0 for ASS, so this is the authoritative cue length. */
+static double subtitle_ass_duration(const char *ass)
+{
+    if (!ass || strncmp(ass, "Dialogue:", 9) != 0) return -1;
+    const char *p = strchr(ass + 9, ',');   // end of Layer
+    if (!p) return -1;
+    const char *end = NULL;
+    double start = parse_ass_timestamp(p + 1, &end);
+    if (start < 0 || !end || *end != ',') return -1;
+    double finish = parse_ass_timestamp(end + 1, NULL);
+    if (finish < 0 || finish <= start) return -1;
+    return finish - start;
+}
+
+/* Text cue for the app: ASS dialogue line -> plain UTF-8. Override blocks
+ * ({...}) and \N/\h escapes are handled; NULL when nothing is left. */
+static char *subtitle_plain_text(const AVSubtitleRect *rect)
+{
+    const char *src = rect->text;
+    if (!src && rect->ass) {
+        src = rect->ass;
+        if (strncmp(src, "Dialogue:", 9) == 0) {
+            src += 9;
+            int commas = 0;
+            while (*src && commas < 9) {
+                if (*src == ',') commas++;
+                src++;
+            }
+            if (commas < 9) src = NULL;
+        }
+    }
+    if (!src || !*src) return NULL;
+
+    char *out = av_malloc(strlen(src) + 1);
+    if (!out) return NULL;
+    char *d = out;
+    int in_override = 0;
+    for (const char *s = src; *s; s++) {
+        if (*s == '{') { in_override = 1; continue; }
+        if (*s == '}') { in_override = 0; continue; }
+        if (in_override) continue;
+        if (*s == '\\' && (s[1] == 'N' || s[1] == 'n')) { *d++ = '\n'; s++; continue; }
+        if (*s == '\\' && s[1] == 'h') { *d++ = ' '; s++; continue; }
+        *d++ = *s;
+    }
+    while (d > out && (d[-1] == ' ' || d[-1] == '\r' || d[-1] == '\n')) d--;
+    *d = '\0';
+    if (d == out) {
+        av_free(out);
+        return NULL;
+    }
+    return out;
+}
+
 static int create_ass_renderer_if_need(FFSubComponent *com)
 {
     if (com->assRenderer) {
@@ -392,6 +465,22 @@ static int subtitle_thread(void *arg)
                         if (!create_ass_renderer_if_need(com)) {
                             const double begin = pts + (double)sub.start_display_time / 1000.0;
                             double end = sub.end_display_time - sub.start_display_time;
+                            if (com->text_callback) {
+                                char *plain = subtitle_plain_text(rect);
+                                if (plain) {
+                                    double cue_end;
+                                    double ass_duration = subtitle_ass_duration(rect->ass);
+                                    if (ass_duration > 0) {
+                                        cue_end = begin + ass_duration;
+                                    } else if (sub.end_display_time > sub.start_display_time) {
+                                        cue_end = begin + (sub.end_display_time - sub.start_display_time) / 1000.0;
+                                    } else {
+                                        cue_end = begin + SUB_MAX_KEEP_DU;
+                                    }
+                                    com->text_callback(com->text_opaque, begin, cue_end, plain);
+                                    av_free(plain);
+                                }
+                            }
                             ff_ass_process_chunk(com->assRenderer, ass_line, begin * 1000, end);
                             com->ass_processed = begin + end/1000.0;
                             num_rect++;
@@ -629,7 +718,7 @@ int subComponent_upload_buffer(FFSubComponent *com, double pts, FFSubtitleBuffer
     }
 }
 
-int subComponent_open(FFSubComponent **cp, int stream_index, AVStream* stream, PacketQueue* packetq, FrameQueue* frameq, const char *enc, subComponent_retry_callback callback, void *opaque, int vw, int vh, double startTime)
+int subComponent_open(FFSubComponent **cp, int stream_index, AVStream* stream, PacketQueue* packetq, FrameQueue* frameq, const char *enc, subComponent_retry_callback callback, subComponent_text_callback text_callback, void *opaque, int vw, int vh, double startTime)
 {
     assert(frameq);
     assert(packetq);
@@ -684,6 +773,8 @@ int subComponent_open(FFSubComponent **cp, int stream_index, AVStream* stream, P
     com->packetq = packetq;
     com->retry_callback = callback;
     com->retry_opaque = opaque;
+    com->text_callback = text_callback;
+    com->text_opaque = opaque;
     com->st_idx = stream_index;
     com->sp = fs_subtitle_default_preference();
     com->previous_uploading = -1;

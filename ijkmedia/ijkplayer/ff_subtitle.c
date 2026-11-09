@@ -72,6 +72,8 @@ typedef struct FFSubtitle {
     SDL_Thread tmp_retry_thread;
     
     AVDictionary *opts;
+    ff_sub_text_callback text_cb;
+    void *text_opaque;
 }FFSubtitle;
 
 //---------------------------Public Common Functions--------------------------------------------------//
@@ -133,6 +135,21 @@ fail:
         av_free(sub);
     }
     return r;
+}
+
+void ff_sub_set_text_callback(FFSubtitle *sub, ff_sub_text_callback cb, void *opaque)
+{
+    if (!sub) return;
+    sub->text_cb = cb;
+    sub->text_opaque = opaque;
+}
+
+static void sub_text_callback_forward(void *opaque, double begin, double end, const char *text)
+{
+    FFSubtitle *sub = opaque;
+    if (sub && sub->text_cb) {
+        sub->text_cb(sub->text_opaque, begin, end, text);
+    }
 }
 
 void ff_sub_desctoy_objs(FFSubtitle *sub)
@@ -454,7 +471,7 @@ static int open_any_stream(FFSubtitle *sub, int stream, const char *enc)
     if (stream < sub->ic_internal->nb_streams) {
         //open internal
         AVStream *st = sub->ic_internal->streams[stream];
-        int r = subComponent_open(&sub->com, stream, st, &sub->packetq, &sub->frameq, enc, &retry_callback, (void *)sub, sub->video_w, sub->video_h, 0.0);
+        int r = subComponent_open(&sub->com, stream, st, &sub->packetq, &sub->frameq, enc, &retry_callback, &sub_text_callback_forward, (void *)sub, sub->video_w, sub->video_h, 0.0);
         if (!r) {
             subComponent_update_preference(sub->com, &sub->sp);
             move_backup_to_normal(sub, stream);
@@ -466,7 +483,7 @@ static int open_any_stream(FFSubtitle *sub, int stream, const char *enc)
             if (!exSub_open_input(&sub->exSub, &sub->packetq, file, sub->streamStartTime, sub->opts)) {
                 AVStream *st = exSub_get_stream(sub->exSub);
                 int st_id = exSub_get_stream_id(sub->exSub);
-                int r = subComponent_open(&sub->com, st_id, st, &sub->packetq, &sub->frameq, enc, &retry_callback, (void *)sub, sub->video_w, sub->video_h, sub->streamStartTime);
+                int r = subComponent_open(&sub->com, st_id, st, &sub->packetq, &sub->frameq, enc, &retry_callback, &sub_text_callback_forward, (void *)sub, sub->video_w, sub->video_h, sub->streamStartTime);
                 if (!r) {
                     subComponent_update_preference(sub->com, &sub->sp);
                     exSub_start_read(sub->exSub);

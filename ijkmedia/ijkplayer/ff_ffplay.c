@@ -2753,7 +2753,7 @@ static void update_sample_display(FFPlayer *ffp, uint8_t *samples, int samples_s
                                         NULL,
                                         -1,
                                         is->audio_src.freq,
-                                        is->audio_src.ch_layout.nb_channels
+                                        is->audio_tgt.ch_layout.nb_channels
                                         );
         }
         return;
@@ -2784,7 +2784,7 @@ static void update_sample_display(FFPlayer *ffp, uint8_t *samples, int samples_s
                                         (int16_t*)((int8_t*)is->sample_array + i * windowSize),
                                         windowSize,
                                         is->audio_tgt.freq,
-                                        is->audio_src.ch_layout.nb_channels
+                                        is->audio_tgt.ch_layout.nb_channels
                                         );
         }
         if (i > 0) {
@@ -4934,6 +4934,24 @@ static int read_thread(void *arg)
 }
 
 static int video_refresh_thread(void *arg);
+/* Forwards decoded text subtitle cues to the Java layer through the message
+ * queue (FFP_MSG_SUBTITLE_TEXT -> MEDIA_TIMED_TEXT). Enabled by
+ * "subtitle-text-callback"; the app uses it for subtitle translation. */
+static void subtitle_text_callback(void *opaque, double begin, double end, const char *text)
+{
+    FFPlayer *ffp = opaque;
+    if (!ffp || !ffp->subtitle_text_callback || !text || !*text) {
+        return;
+    }
+    int begin_ms = (int)(begin * 1000.0 + 0.5);
+    int end_ms = (int)(end * 1000.0 + 0.5);
+    if (end_ms <= begin_ms) {
+        end_ms = begin_ms + 1000;
+    }
+    ffp_notify_msg4(ffp, FFP_MSG_SUBTITLE_TEXT, begin_ms, end_ms, (void *)text,
+                    (int)strlen(text) + 1);
+}
+
 static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputFormat *iformat)
 {
     assert(!ffp->is);
@@ -4986,6 +5004,9 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
     if (!ffp->subtitle_disable && ff_sub_init(&is->ffSub, opts) < 0) {
         av_dict_free(&opts);
         goto fail;
+    }
+    if (is->ffSub) {
+        ff_sub_set_text_callback(is->ffSub, subtitle_text_callback, ffp);
     }
     av_dict_free(&opts);
     if (!(is->continue_read_thread = SDL_CreateCond())) {

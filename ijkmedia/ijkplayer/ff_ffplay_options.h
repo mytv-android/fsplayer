@@ -84,6 +84,8 @@ static const AVOption ffp_context_options[] = {
         OPTION_OFFSET(seek_at_start),       OPTION_INT64(0, 0, INT_MAX) },
     { "subtitle_mix",                   "mix subtitle images use gpu",
         OPTION_OFFSET(subtitle_mix),        OPTION_INT(1, 0, 1) },
+    { "subtitle-text-callback",         "deliver decoded text subtitle cues to the app",
+        OPTION_OFFSET(subtitle_text_callback), OPTION_INT(0, 0, 1) },
     // FFP_MERGE: window_title
 #if CONFIG_AUDIO_AVFILTER
     { "af",                             "audio filters",
