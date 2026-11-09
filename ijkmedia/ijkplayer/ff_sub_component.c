@@ -321,8 +321,10 @@ static double parse_ass_timestamp(const char *p, const char **out_end)
  * are usually 0 for ASS, so this is the authoritative cue length. */
 static double subtitle_ass_duration(const char *ass)
 {
-    if (!ass || strncmp(ass, "Dialogue:", 9) != 0) return -1;
-    const char *p = strchr(ass + 9, ',');   // end of Layer
+    if (!ass) return -1;
+    const char *p = ass;
+    if (strncmp(p, "Dialogue:", 9) == 0) p += 9;
+    p = strchr(p, ',');   // end of Layer
     if (!p) return -1;
     const char *end = NULL;
     double start = parse_ass_timestamp(p + 1, &end);
@@ -338,15 +340,36 @@ static char *subtitle_plain_text(const AVSubtitleRect *rect)
 {
     const char *src = rect->text;
     if (!src && rect->ass) {
-        src = rect->ass;
-        if (strncmp(src, "Dialogue:", 9) == 0) {
-            src += 9;
-            int commas = 0;
-            while (*src && commas < 9) {
-                if (*src == ',') commas++;
-                src++;
+        /* Some decoders hand over the full "Dialogue: Layer,Start,..." line,
+         * others only the fields after it. Skip 9 fields when they exist. */
+        const char *fields = rect->ass;
+        if (strncmp(fields, "Dialogue:", 9) == 0) fields += 9;
+        /* Text often starts with an override tag; the number of event fields
+         * differs between decoders (8 or 9 commas), so the tag position is
+         * the reliable marker when present. */
+        const char *tag = NULL;
+        const char *p = fields;
+        int commas = 0;
+        for (; *p; p++) {
+            if (*p == '{') {
+                if (commas >= 7) tag = p;
+                break;
             }
-            if (commas < 9) src = NULL;
+            if (*p == ',') commas++;
+        }
+        if (tag) {
+            src = tag;
+        } else {
+            commas = 0;
+            int in_tag = 0;
+            p = fields;
+            while (*p && commas < 9) {
+                if (*p == '{') in_tag = 1;
+                else if (*p == '}') in_tag = 0;
+                else if (*p == ',' && !in_tag) commas++;
+                p++;
+            }
+            src = commas == 9 ? p : rect->ass;
         }
     }
     if (!src || !*src) return NULL;
