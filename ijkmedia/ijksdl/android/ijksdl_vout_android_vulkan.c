@@ -466,8 +466,11 @@ int SDL_VoutAndroid_PrepareRenderer(SDL_Vout *vout, int backend)
         __system_property_get("debug.fsplayer.renderer", debug);
         if (!strcmp(debug, "gles3") || !strcmp(debug, "opengl"))
             backend = SDL_ANDROID_RENDERER_OPENGL;
-        else if (!strcmp(debug, "vulkan"))
+        else if (!strcmp(debug, "vulkan")) {
             backend = SDL_ANDROID_RENDERER_VULKAN;
+            /* 属性强制 Vulkan 时不再要求 AHB 零拷贝，便于在无 AHB 的环境排查 Vulkan 渲染 */
+            requested = SDL_ANDROID_RENDERER_VULKAN;
+        }
     }
     if (backend == SDL_ANDROID_RENDERER_OPENGL) {
         result = initialize_backend(o, backend, 0);

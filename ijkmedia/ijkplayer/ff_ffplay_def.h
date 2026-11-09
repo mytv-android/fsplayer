@@ -543,6 +543,7 @@ typedef struct FFPlayer {
     double rdftspeed;
 
     int autorotate;
+    int max_audio_output_channels;
     int find_stream_info;
     unsigned sws_flags;
 

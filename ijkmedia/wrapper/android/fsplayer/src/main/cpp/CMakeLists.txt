@@ -121,6 +121,7 @@ set(OPENSSL_SSL   ${UNI_DIR}/openssl/openssl-${ARCH}/lib/libssl.a)
 set(OPENSSL_CRYPTO ${UNI_DIR}/openssl/openssl-${ARCH}/lib/libcrypto.a)
 
 # ffmpeg 编译时启用并链接的三方库（pkgconfig Libs 里列出的）
+set(AV3A_LIB      ${UNI_DIR}/av3a/av3a-${ARCH}/lib/libav3a_decoder.a)
 set(DAV1D_LIB     ${UNI_DIR}/dav1d/dav1d-${ARCH}/lib/libdav1d.a)
 set(OPUS_LIB      ${UNI_DIR}/opus/opus-${ARCH}/lib/libopus.a)
 set(UAVS3D_LIB    ${UNI_DIR}/uavs3d/uavs3d-${ARCH}/lib/libuavs3d.a)
@@ -155,6 +156,7 @@ target_link_libraries(fsplayer
     ${DAV1D_LIB}
     ${OPUS_LIB}
     ${UAVS3D_LIB}
+    ${AV3A_LIB}
     ${XML2_LIB}
     ${BLURAY_LIB}
     ${OPENSSL_SSL}

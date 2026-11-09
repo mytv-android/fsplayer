@@ -133,6 +133,8 @@ static const AVOption ffp_context_options[] = {
 
     { "max-buffer-size",                    "max buffer size (500MB) should be pre-read,support auto decision",
         OPTION_OFFSET(dcc.max_buffer_size), OPTION_INT(0, 0, 524288000 ) },
+    { "max-audio-output-channels",          "clamp AV3A multichannel output to N channels per sink capability (0 = no limit)",
+        OPTION_OFFSET(max_audio_output_channels), OPTION_INT(0, 0, 12) },
     { "min-frames",                         "minimal frames to stop pre-reading",
         OPTION_OFFSET(dcc.min_frames),      OPTION_INT(DEFAULT_MIN_FRAMES, MIN_MIN_FRAMES, MAX_MIN_FRAMES) },
     { "first-high-water-mark-ms",           "first chance to wakeup read_thread",

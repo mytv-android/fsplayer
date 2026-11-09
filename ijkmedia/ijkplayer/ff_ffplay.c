@@ -3303,6 +3303,16 @@ static int audio_open(FFPlayer *opaque, AVChannelLayout *wanted_channel_layout, 
         av_channel_layout_uninit(wanted_channel_layout);
         av_channel_layout_default(wanted_channel_layout, wanted_nb_channels);
     }
+    /* AV3A 声道数超过 sink 能力时钳制到 max-audio-output-channels，
+       aresample 会在 filter 重配时下混到 audio_tgt 布局 */
+    if (ffp->max_audio_output_channels > 0 &&
+        wanted_channel_layout->nb_channels > ffp->max_audio_output_channels &&
+        is->audio_st && is->audio_st->codecpar->codec_id == AV_CODEC_ID_AVS3DA) {
+        av_channel_layout_uninit(wanted_channel_layout);
+        av_channel_layout_default(wanted_channel_layout, ffp->max_audio_output_channels);
+        if (wanted_channel_layout->order == AV_CHANNEL_ORDER_NATIVE)
+            wanted_channel_layout->u.mask &= ~AV_CH_LAYOUT_STEREO_DOWNMIX;
+    }
     wanted_nb_channels = wanted_channel_layout->nb_channels;
     wanted_spec.channels = wanted_nb_channels;
     wanted_spec.freq = wanted_sample_rate;
