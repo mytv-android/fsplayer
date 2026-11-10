@@ -42,6 +42,10 @@ typedef struct AudioChannelMapEntry {
     const char *android_name;
 } AudioChannelMapEntry;
 static AudioChannelMapEntry g_audio_channel_map[] = {
+    { 12, CHANNEL_OUT_7POINT1POINT4, "12-chan", "CHANNEL_OUT_7POINT1POINT4" },
+    { 10, CHANNEL_OUT_5POINT1POINT4, "10-chan", "CHANNEL_OUT_5POINT1POINT4" },
+    { 8,  CHANNEL_OUT_7POINT1_SURROUND, "8-chan", "CHANNEL_OUT_7POINT1_SURROUND" },
+    { 6,  CHANNEL_OUT_5POINT1, "6-chan", "CHANNEL_OUT_5POINT1" },
     { 2, CHANNEL_OUT_STEREO, "2-chan", "CHANNEL_OUT_STEREO" },
     { 1, CHANNEL_OUT_MONO, "1-chan", "CHANNEL_OUT_MONO" },
 };
@@ -153,6 +157,18 @@ SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_An
         break;
     case CHANNEL_OUT_STEREO:
         ALOGI("SDL_Android_AudioTrack: %s", "CHANNEL_OUT_STEREO");
+        break;
+    case CHANNEL_OUT_5POINT1:
+        ALOGI("SDL_Android_AudioTrack: %s", "CHANNEL_OUT_5POINT1");
+        break;
+    case CHANNEL_OUT_7POINT1_SURROUND:
+        ALOGI("SDL_Android_AudioTrack: %s", "CHANNEL_OUT_7POINT1_SURROUND");
+        break;
+    case CHANNEL_OUT_5POINT1POINT4:
+        ALOGI("SDL_Android_AudioTrack: %s", "CHANNEL_OUT_5POINT1POINT4");
+        break;
+    case CHANNEL_OUT_7POINT1POINT4:
+        ALOGI("SDL_Android_AudioTrack: %s", "CHANNEL_OUT_7POINT1POINT4");
         break;
     default:
         ALOGE("%s: invalid channel %d", __func__, spec->channel_config);

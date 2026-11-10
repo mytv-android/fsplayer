@@ -24,6 +24,7 @@
 #include "ijkplayer_android.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include "ijksdl/android/ijksdl_android.h"
 #include "../ff_fferror.h"
 #include "../ff_ffplay.h"
@@ -201,6 +202,55 @@ int ijkmp_android_get_audio_session_id(JNIEnv *env, IjkMediaPlayer *mp)
     MPTRACE("%s()=%d", __func__, audio_session_id);
 
     return audio_session_id;
+}
+
+static int copy_codec_info(char *buf, size_t buf_size, const char *name, const char *impl)
+{
+    if ((!name || !name[0]) && (!impl || !impl[0]))
+        return -1;
+    if (impl && impl[0])
+        snprintf(buf, buf_size, "%s,%s", name ? name : "", impl);
+    else
+        snprintf(buf, buf_size, "%s", name ? name : "");
+    return 0;
+}
+
+int ijkmp_android_get_video_codec_info(IjkMediaPlayer *mp, char *buf, size_t buf_size)
+{
+    const char *name = NULL;
+    const char *impl = NULL;
+    int ret = -1;
+
+    if (!mp || !buf || buf_size == 0)
+        return -1;
+
+    pthread_mutex_lock(&mp->mutex);
+    if (mp->ffplayer) {
+        name = ffp_get_video_codec_name(mp->ffplayer);
+        impl = ffp_get_video_codec_impl_name(mp->ffplayer);
+    }
+    ret = copy_codec_info(buf, buf_size, name, impl);
+    pthread_mutex_unlock(&mp->mutex);
+    return ret;
+}
+
+int ijkmp_android_get_audio_codec_info(IjkMediaPlayer *mp, char *buf, size_t buf_size)
+{
+    const char *name = NULL;
+    const char *impl = NULL;
+    int ret = -1;
+
+    if (!mp || !buf || buf_size == 0)
+        return -1;
+
+    pthread_mutex_lock(&mp->mutex);
+    if (mp->ffplayer) {
+        name = ffp_get_audio_codec_name(mp->ffplayer);
+        impl = ffp_get_audio_codec_impl_name(mp->ffplayer);
+    }
+    ret = copy_codec_info(buf, buf_size, name, impl);
+    pthread_mutex_unlock(&mp->mutex);
+    return ret;
 }
 
 void ijkmp_android_set_mediacodec_select_callback(IjkMediaPlayer *mp, bool (*callback)(void *opaque, ijkmp_mediacodecinfo_context *mcc), void *opaque)

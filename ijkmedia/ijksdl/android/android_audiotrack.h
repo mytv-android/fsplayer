@@ -53,6 +53,10 @@ typedef struct SDL_Android_AudioTrack_Spec {
         CHANNEL_OUT_SURROUND = 0x41c, /* f-l, f-r, f-c, b-c */
         CHANNEL_OUT_5POINT1 = 0xfc, /* f-l, f-r, b-l, b-r, f-c, low */
         CHANNEL_OUT_7POINT1 = 0x3fc, /* f-l, f-r, b-l, b-r, f-c, low, f-lc, f-rc */
+        CHANNEL_OUT_7POINT1_SURROUND = 0x18FC, /* f-l, f-r, f-c, low, b-l, b-r, s-l, s-r */
+        /* API 32 才有官方常量，这里直接给掩码：AV3A 等多声道源使用 */
+        CHANNEL_OUT_5POINT1POINT4 = 0xB40FC, /* 5.1.4: FL FR FC LFE BL BR TFL TFR TBL TBR */
+        CHANNEL_OUT_7POINT1POINT4 = 0xB58FC, /* 7.1.4: FL FR FC LFE BL BR SL SR TFL TFR TBL TBR */
 
         CHANNEL_OUT_FRONT_LEFT = 0x4,
         CHANNEL_OUT_FRONT_RIGHT = 0x8,

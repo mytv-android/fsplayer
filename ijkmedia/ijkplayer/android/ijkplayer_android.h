@@ -43,6 +43,14 @@ int  ijkmp_android_get_audio_session_id(JNIEnv *env, IjkMediaPlayer *mp);
 void ijkmp_android_set_mediacodec_select_callback(IjkMediaPlayer *mp, bool (*callback)(void *opaque, ijkmp_mediacodecinfo_context *mcc), void *opaque);
 
 /*
+ * 取音频/视频解码器信息，写字成 "codec_name,impl_name"（impl 可能为空），
+ * 对应 Java 侧 FSPlayer.getMediaInfo() 的 _getVideoCodecInfo/_getAudioCodecInfo。
+ * 返回 0 成功，-1 表示解码器尚未建立。
+ */
+int ijkmp_android_get_video_codec_info(IjkMediaPlayer *mp, char *buf, size_t buf_size);
+int ijkmp_android_get_audio_codec_info(IjkMediaPlayer *mp, char *buf, size_t buf_size);
+
+/*
  * 取一张当前画面的快照（type 见 ijksdl/android/vulkan/fs_vulkan_renderer.h 的
  * FSSnapshotType，对齐 iOS）。会先让视频线程把当前帧重画一次。
  * 成功返回 0，*out_pixels 是 malloc 出来的 RGBA8888，调用方 free。

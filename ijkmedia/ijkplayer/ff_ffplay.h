@@ -93,6 +93,13 @@ void      ffp_set_property_float(FFPlayer *ffp, int id, float value);
 int64_t   ffp_get_property_int64(FFPlayer *ffp, int id, int64_t default_value);
 void      ffp_set_property_int64(FFPlayer *ffp, int id, int64_t value);
 
+/* 内核当前实际使用的解码器名：硬解为 MediaCodec 实现名（c2./OMX. 开头），
+   软解为 FFmpeg 解码器名。返回的字符串由内核持有，调用方需自行拷贝。 */
+const char *ffp_get_video_codec_impl_name(FFPlayer *ffp);
+const char *ffp_get_video_codec_name(FFPlayer *ffp);
+const char *ffp_get_audio_codec_impl_name(FFPlayer *ffp);
+const char *ffp_get_audio_codec_name(FFPlayer *ffp);
+
 /* must be freed with free(); */
 struct IjkMediaMeta *ffp_get_meta_l(FFPlayer *ffp);
 void ffp_set_audio_extra_delay(FFPlayer *ffp, const float delay);

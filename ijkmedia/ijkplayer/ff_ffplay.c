@@ -45,6 +45,9 @@
 #include "libavutil/bprint.h"
 #include "libavutil/buffer.h"
 #include "libavformat/avformat.h"
+#if defined(__ANDROID__)
+#include "libavcodec/mediacodec.h"
+#endif
 #if CONFIG_AVDEVICE
 #include "libavdevice/avdevice.h"
 #endif
@@ -6699,6 +6702,53 @@ void ffp_set_property_float(FFPlayer *ffp, int id, float value)
         default:
             return;
     }
+}
+
+/* 解码器实现名：硬解取 FFmpeg 里实际选中的 MediaCodec 实现名，
+   软解退回 FFmpeg 解码器名。字符串由内核持有，返回 NULL 表示尚不可知。 */
+static const char *decoder_impl_name(AVCodecContext *avctx)
+{
+    if (!avctx)
+        return NULL;
+#if defined(__ANDROID__)
+    const char *mediacodec_name = av_mediacodec_get_selected_codec_name(avctx);
+    if (mediacodec_name && mediacodec_name[0])
+        return mediacodec_name;
+#endif
+    return avctx->codec ? avctx->codec->name : NULL;
+}
+
+static const char *decoder_codec_name(AVCodecContext *avctx)
+{
+    return avctx ? avcodec_get_name(avctx->codec_id) : NULL;
+}
+
+const char *ffp_get_video_codec_impl_name(FFPlayer *ffp)
+{
+    if (!ffp || !ffp->is || ffp->is->video_stream < 0)
+        return NULL;
+    return decoder_impl_name(ffp->is->viddec.avctx);
+}
+
+const char *ffp_get_video_codec_name(FFPlayer *ffp)
+{
+    if (!ffp || !ffp->is || ffp->is->video_stream < 0)
+        return NULL;
+    return decoder_codec_name(ffp->is->viddec.avctx);
+}
+
+const char *ffp_get_audio_codec_impl_name(FFPlayer *ffp)
+{
+    if (!ffp || !ffp->is || ffp->is->audio_stream < 0)
+        return NULL;
+    return decoder_impl_name(ffp->is->auddec.avctx);
+}
+
+const char *ffp_get_audio_codec_name(FFPlayer *ffp)
+{
+    if (!ffp || !ffp->is || ffp->is->audio_stream < 0)
+        return NULL;
+    return decoder_codec_name(ffp->is->auddec.avctx);
 }
 
 int64_t ffp_get_property_int64(FFPlayer *ffp, int id, int64_t default_value)

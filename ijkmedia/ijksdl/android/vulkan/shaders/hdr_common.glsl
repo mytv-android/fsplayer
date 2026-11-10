@@ -94,19 +94,32 @@ vec3 tonemap(vec3 x)
     return x * sig / sig_orig;
 }
 
-// 直显模式（HDR 屏）：只做 EOTF + 色域转换，不压缩动态范围，
-// 归一化到 203 nits 为 1.0，>1.0 的部分交给 EDR/HDR 层。
+// ---- SMPTE ST 2084 OETF（线性光 -> PQ 电信号），HDR10 交换链直显用 ----
+float st_2084_oetf(float L)
+{
+    const float M1 = 0.1593017578125;
+    const float M2 = 78.84375;
+    const float C1 = 0.8359375;
+    const float C2 = 18.8515625;
+    const float C3 = 18.6875;
+    float Lm = pow(max(L, 0.0), M1);
+    return pow((C1 + C2 * Lm) / (1.0 + C3 * Lm), M2);
+}
+
+// 直显模式：交换链是 10bit HDR10(PQ/BT.2020)，输出必须是 PQ 编码的 BT.2020
+// 电信号，交给合成器与显示器；这里不压缩动态范围。
 vec3 hdr_direct(vec3 rgb_2020, int tf)
 {
-    vec3 linear;
     if (tf == FS_TRANSFER_PQ) {
-        linear = st_2084_eotf_vec(rgb_2020) * (10000.0 / 203.0);
-    } else if (tf == FS_TRANSFER_HLG) {
-        linear = arib_b67_eotf_vec(rgb_2020) * (1000.0 / 203.0);
-    } else {
-        linear = rec_1886_eotf_vec(rgb_2020);
+        return rgb_2020;                       // 采样值本身就是 PQ 电信号
     }
-    return RGB2020_TO_RGB709 * linear;
+    vec3 linear;
+    if (tf == FS_TRANSFER_HLG) {
+        linear = arib_b67_eotf_vec(rgb_2020) * (1000.0 / 10000.0);
+    } else {
+        linear = rec_1886_eotf_vec(rgb_2020) * (100.0 / 10000.0);
+    }
+    return vec3(st_2084_oetf(linear.r), st_2084_oetf(linear.g), st_2084_oetf(linear.b));
 }
 
 // SDR 屏：EOTF -> 色域转到 BT.709 -> 色调映射（peak_luminance = 50，和 iOS 一致）

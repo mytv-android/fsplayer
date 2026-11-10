@@ -95,6 +95,7 @@ struct FSVulkanRenderer {
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkFormat swapchain_format;
+    VkColorSpaceKHR swapchain_color_space;
     VkExtent2D swapchain_extent;
     uint32_t image_count;
     VkImage *swapchain_images;
@@ -250,6 +251,8 @@ struct FSVulkanRenderer {
     int hdr_display;         /* 直显 HDR（= 内容 HDR && 允许 && 屏支持）*/
     int allow_hdr_display;   /* iOS 的 allowHDRDirectDisplay，默认允许 */
     int display_hdr_support; /* 当前 swapchain 能否直接输出 HDR（8bit UNORM 时为 0）*/
+    int want_hdr;            /* 本帧希望用 HDR10(PQ) 交换链直显 */
+    int hdr_swapchain_unsupported; /* surface 不提供 HDR10 交换链，别再尝试重建 */
 
     /* ---- 快照 ---- */
     volatile int   snapshot_type;      /* -1 = 没有请求 */
@@ -567,15 +570,51 @@ static VkResult create_surface_swapchain(FSVulkanRenderer *r)
     if (fmt_count > 16) fmt_count = 16;
     vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical_device, r->surface, &fmt_count, formats);
 
+    /* HDR 内容希望直显：优先 10bit 交换链 + HDR10(ST2084) 色彩空间，
+       合成器据此把图层标成 HDR，显示器才会切到 HDR 模式。surface 不支持时
+       退回 SDR 交换链，由着色器做色调映射。 */
     VkSurfaceFormatKHR chosen = formats[0];
-    for (uint32_t i = 0; i < fmt_count; i++) {
-        if (formats[i].format == VK_FORMAT_R8G8B8A8_UNORM ||
-            formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) {
-            chosen = formats[i];
-            break;
+    int hdr_swapchain = 0;
+    if (r->want_hdr && !r->hdr_swapchain_unsupported) {
+        for (uint32_t i = 0; i < fmt_count; i++) {
+            if (formats[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                formats[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                chosen = formats[i];
+                hdr_swapchain = 1;
+                break;
+            }
+        }
+        if (!hdr_swapchain) {
+            for (uint32_t i = 0; i < fmt_count; i++) {
+                if (formats[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                    chosen = formats[i];
+                    hdr_swapchain = 1;
+                    break;
+                }
+            }
+        }
+        if (!hdr_swapchain) {
+            /* 这台设备的窗口不支持 HDR10 交换链，本播放会话内不再尝试 */
+            r->hdr_swapchain_unsupported = 1;
+            r->want_hdr = 0;
+            ALOGW("FSVulkanRenderer: HDR10 swapchain unavailable, tone-map to SDR\n");
+        }
+    }
+    if (!hdr_swapchain) {
+        chosen = formats[0];
+        for (uint32_t i = 0; i < fmt_count; i++) {
+            if (formats[i].format == VK_FORMAT_R8G8B8A8_UNORM ||
+                formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) {
+                chosen = formats[i];
+                break;
+            }
         }
     }
     r->swapchain_format = chosen.format;
+    r->swapchain_color_space = chosen.colorSpace;
+    r->display_hdr_support = hdr_swapchain;
+    ALOGI("FSVulkanRenderer: swapchain format=0x%x colorSpace=0x%x hdr=%d\n",
+          (unsigned)chosen.format, (unsigned)chosen.colorSpace, hdr_swapchain);
 
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
@@ -1438,7 +1477,10 @@ FSVulkanRenderer *fs_vulkan_renderer_create(void)
     r->hdr_full_range = 0;
     r->hdr_display = 0;
     r->allow_hdr_display = 1;   /* iOS 的默认值是 YES */
-    r->display_hdr_support = 0; /* swapchain 是 8bit UNORM，直接输出 HDR 需要 10bit/浮点交换链 */
+    r->display_hdr_support = 0; /* 由 swapchain 创建结果决定（HDR10 交换链为 1）*/
+    r->want_hdr = 0;
+    r->hdr_swapchain_unsupported = 0;
+    r->swapchain_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     r->bg_result_slot = -1;
     r->scaling_mode = FS_SCALING_MODE_ASPECT_FIT;
     r->x_rotate_degrees = 0.0f;
@@ -3255,29 +3297,10 @@ int fs_vulkan_renderer_get_scaling_mode(FSVulkanRenderer *r)
     return r ? r->scaling_mode : FS_SCALING_MODE_ASPECT_FIT;
 }
 
-int fs_vulkan_renderer_display(FSVulkanRenderer *r, const AVFrame *frame,
-                               int disp_w, int disp_h,
-                               int rotate_degrees, int sar_num, int sar_den)
+/* 由帧的 YCbCr 元数据更新 HDR 状态；内容 HDR 且允许时请求 HDR10 交换链。
+   需要切换 SDR/HDR 交换链时置 dirty，由 sync_surface 在本帧绘制前重建。 */
+static void update_hdr_state(FSVulkanRenderer *r, const AVFrame *frame)
 {
-    if (!r || !r->surface_ready || !frame)
-        return -1;
-
-    /* surface 可能被 resize：先在建帧变换之前重建，确保后面用的是最新的 drawable 尺寸 */
-    if (fs_vulkan_renderer_sync_surface(r) != 0 || !r->surface_ready)
-        return -1;
-
-    compute_video_transform(r, frame->width, frame->height, disp_w, disp_h,
-                            rotate_degrees, sar_num, sar_den);
-
-    /* MediaCodec 硬解：零拷贝外部显存通路 */
-    if (frame->format == AV_PIX_FMT_MEDIACODEC)
-        return display_mc_frame(r, frame);
-
-    /*
-     * HDR 判定对齐 iOS FSMetalPipelineMeta：YCbCr 矩阵是 BT.2020 就算 HDR，
-     * 传输函数取 PQ / HLG / 线性，色域范围取帧的 color_range。
-     * 屏能直出（display_hdr_support）且允许时才不做色调映射。
-     */
     r->hdr_content = (frame->colorspace == AVCOL_SPC_BT2020_NCL ||
                       frame->colorspace == AVCOL_SPC_BT2020_CL) ? 1 : 0;
     r->hdr_full_range = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
@@ -3288,7 +3311,39 @@ int fs_vulkan_renderer_display(FSVulkanRenderer *r, const AVFrame *frame,
     } else {
         r->hdr_transfer = 0;                 /* 线性 */
     }
+
+    /* HDR10 交换链只编码 PQ：HLG 内容在着色器里转成 PQ；传输函数未知的
+       BT.2020 内容仍按 SDR 路径做色调映射 */
+    int want = (r->hdr_content && r->allow_hdr_display &&
+                r->hdr_transfer != 0 && !r->hdr_swapchain_unsupported) ? 1 : 0;
+    if (want != r->display_hdr_support) {
+        r->want_hdr = want;
+        r->swapchain_dirty = 1;
+    }
     r->hdr_display = (r->hdr_content && r->allow_hdr_display && r->display_hdr_support) ? 1 : 0;
+}
+
+int fs_vulkan_renderer_display(FSVulkanRenderer *r, const AVFrame *frame,
+                               int disp_w, int disp_h,
+                               int rotate_degrees, int sar_num, int sar_den)
+{
+    if (!r || !r->surface_ready || !frame)
+        return -1;
+
+    update_hdr_state(r, frame);
+
+    /* surface 可能被 resize：先在建帧变换之前重建，确保后面用的是最新的 drawable 尺寸 */
+    if (fs_vulkan_renderer_sync_surface(r) != 0 || !r->surface_ready)
+        return -1;
+    /* 交换链重建可能刚把 HDR 直显打开/关掉，按最终状态重算 */
+    r->hdr_display = (r->hdr_content && r->allow_hdr_display && r->display_hdr_support) ? 1 : 0;
+
+    compute_video_transform(r, frame->width, frame->height, disp_w, disp_h,
+                            rotate_degrees, sar_num, sar_den);
+
+    /* MediaCodec 硬解：零拷贝外部显存通路 */
+    if (frame->format == AV_PIX_FMT_MEDIACODEC)
+        return display_mc_frame(r, frame);
 
     const uint8_t *y, *u, *v;
     int y_stride, u_stride, v_stride, w, h, is10bit = 0;

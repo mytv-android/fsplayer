@@ -585,17 +585,37 @@ FSPlayer_getColorFormatName(JNIEnv *env, jclass clazz, jint mediaCodecColorForma
 static jstring
 FSPlayer_getVideoCodecInfo(JNIEnv *env, jobject thiz)
 {
-    (void)env; (void)thiz;
-    /* 最小可播放（软解，无 MediaCodec）：返回 NULL */
-    return NULL;
+    IjkMediaPlayer *mp = NULL;
+    char info[256] = {0};
+    jstring jret = NULL;
+
+    mp = jni_get_media_player(env, thiz);
+    JNI_CHECK_GOTO(mp, env, "java/lang/IllegalStateException", "mpjni: getVideoCodecInfo: null mp", LABEL_RETURN);
+
+    if (ijkmp_android_get_video_codec_info(mp, info, sizeof(info)) == 0 && info[0])
+        jret = (*env)->NewStringUTF(env, info);
+
+LABEL_RETURN:
+    ijkmp_dec_ref_p(&mp);
+    return jret;
 }
 
 static jstring
 FSPlayer_getAudioCodecInfo(JNIEnv *env, jobject thiz)
 {
-    (void)env; (void)thiz;
-    /* 最小可播放（软解，无 MediaCodec）：返回 NULL */
-    return NULL;
+    IjkMediaPlayer *mp = NULL;
+    char info[256] = {0};
+    jstring jret = NULL;
+
+    mp = jni_get_media_player(env, thiz);
+    JNI_CHECK_GOTO(mp, env, "java/lang/IllegalStateException", "mpjni: getAudioCodecInfo: null mp", LABEL_RETURN);
+
+    if (ijkmp_android_get_audio_codec_info(mp, info, sizeof(info)) == 0 && info[0])
+        jret = (*env)->NewStringUTF(env, info);
+
+LABEL_RETURN:
+    ijkmp_dec_ref_p(&mp);
+    return jret;
 }
 
 inline static void fillMetaInternal(JNIEnv *env, jobject jbundle, IjkMediaMeta *meta, const char *key, const char *default_value)
