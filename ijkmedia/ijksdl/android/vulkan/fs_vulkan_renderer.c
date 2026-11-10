@@ -589,6 +589,16 @@ static VkResult create_surface_swapchain(FSVulkanRenderer *r)
         image_count = caps.maxImageCount;
     r->image_count = image_count;
 
+    /* 渲染始终按窗口坐标进行，不预旋转内容：preTransform 一律声明 IDENTITY，
+       让 presentation engine 负责窗口旋转（currentTransform）。若照抄
+       currentTransform，横屏（窗口被旋转 90/270）时不预旋转的画面会被再转一次，
+       表现为整个视频侧躺。 */
+    VkSurfaceTransformFlagBitsKHR pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    if (!(caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+        pre_transform = caps.currentTransform;
+    ALOGI("FSVulkanRenderer: preTransform=0x%x current=0x%x supported=0x%x\n",
+          pre_transform, caps.currentTransform, caps.supportedTransforms);
+
     VkSwapchainCreateInfoKHR swci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = r->surface,
@@ -599,7 +609,7 @@ static VkResult create_surface_swapchain(FSVulkanRenderer *r)
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .preTransform = caps.currentTransform,
+        .preTransform = pre_transform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode = VK_PRESENT_MODE_FIFO_KHR,
         .clipped = VK_TRUE,
