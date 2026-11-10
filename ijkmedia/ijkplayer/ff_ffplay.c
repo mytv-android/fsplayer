@@ -133,6 +133,10 @@ int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
 static void free_picture(Frame *vp);
 static double consume_audio_buffer(FFPlayer *ffp, double diff);
 static void update_sample_display(FFPlayer *ffp, uint8_t *samples, int samples_size);
+static void asr_packet_tap_open(FFPlayer *ffp, int stream_index);
+static void asr_packet_tap_close(FFPlayer *ffp);
+static void asr_packet_tap_put(FFPlayer *ffp, const AVPacket *pkt);
+static void asr_packet_tap_flush(FFPlayer *ffp);
 
 #include "ff_heic_tile.h"
 
@@ -721,6 +725,7 @@ static void stream_component_close(FFPlayer *ffp, int stream_index)
     ic->streams[stream_index]->discard = AVDISCARD_ALL;
     switch (codecpar->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
+        asr_packet_tap_close(ffp);
         is->audio_st = NULL;
         is->audio_stream = -1;
         break;
@@ -3695,6 +3700,457 @@ static void _ijkmeta_set_stream(FFPlayer* ffp, int type, int stream)
     }
 }
 
+/*
+ * ---- ASR 包级旁路（asr-packet-tap） ----
+ * 读线程把音频包放进 audioq 时另引用一份交给旁路：旁路有自己的包队列（按时长封顶、满了丢最旧，
+ * 从不阻塞读线程）、自己的线程和 AVCodecContext，解出的 PCM 重采样成 16 kHz 单声道 s16，
+ * 每 100 ms 送出一次，PTS 在 ffp_get_current_position_l 的位置时钟上。旁路领先可见播放的量就是
+ * 读线程读在播放位置之前的量，与画面同一时钟，ffmpeg 能播的协议都适用，也不多花流量。
+ * seek / 不连续时随 audioq 一起清空并换代；随音频组件打开 / 关闭（换音轨即换解码器）。
+ *
+ * 送出复用输出端已有的采样回调 audio_samples_callback（Java 层原样透传，AAR 不用改）：
+ * 声道数填标记 FS_ASR_PACKET_TAP_CHANNELS、采样率 16000；前 ASR_TAP_PTS_WORDS 个 int16 是
+ * 64 位 PTS 微秒（小端 16 位字，低位字在前），其后是单声道 s16 样本。只在选项打开且装了采样回调时送，
+ * 输出端原有的采样回调照常工作。
+ */
+#define FS_ASR_PACKET_TAP_CHANNELS  0x41535231              /* "ASR1"：包级旁路帧标记，真实声道数不会是这个值 */
+#define ASR_TAP_SAMPLE_RATE         16000
+#define ASR_TAP_CHUNK_SAMPLES       1600                    /* 100 ms 送一次 */
+#define ASR_TAP_PTS_WORDS           4                       /* 帧头：64 位 PTS 拆成 4 个 16 位字 */
+#define ASR_TAP_MAX_QUEUE_US        (120LL * 1000 * 1000)   /* 包队列最多攒 120 s */
+#define ASR_TAP_MAX_QUEUE_PACKETS   20000
+#define ASR_TAP_MAX_QUEUE_BYTES     (16 * 1024 * 1024)
+#define ASR_TAP_FALLBACK_PKT_US     21333                   /* 包和码流都没有时长时按 1024 样本 @48 kHz 估 */
+
+typedef struct AsrTapPacket {
+    AVPacket *pkt;
+    int64_t duration_us;
+    int serial;
+    struct AsrTapPacket *next;
+} AsrTapPacket;
+
+typedef struct FFAsrPacketTap {
+    FFPlayer *ffp;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+    SDL_Thread _thread;
+    SDL_Thread *thread;
+    /* 以下受 mutex 保护：读线程入队 / 清空，旁路线程出队 */
+    int abort_request;
+    int serial;
+    AsrTapPacket *first_pkt;
+    AsrTapPacket *last_pkt;
+    int nb_packets;
+    int64_t bytes;
+    int64_t duration_us;
+    /* 打开后只读 */
+    AVRational time_base;
+    int64_t start_time;
+    int no_time_adjust;
+    int64_t fallback_pkt_us;
+    /* 以下只在旁路线程使用 */
+    AVCodecContext *avctx;
+    struct SwrContext *swr;
+    int swr_in_rate;
+    int swr_in_channels;
+    int swr_in_format;
+    int swr_error_logged;
+    uint8_t *conv_buf;
+    unsigned int conv_buf_size;
+    int16_t *chunk;                 /* 帧头 ASR_TAP_PTS_WORDS 个字 + 最多 ASR_TAP_CHUNK_SAMPLES 个样本 */
+    int chunk_samples;
+    int64_t chunk_pts_us;
+    int64_t next_pts_us;
+} FFAsrPacketTap;
+
+/*
+ * 码流时间（微秒）换到 ffp_get_current_position_l 的位置时钟：减 ic->start_time（无效或 <= 0 不减），
+ * 不足 0 按 0 计；no_time_adjust 时与位置一样原样返回。上层拿到的就是 getCurrentPosition() * 1000 的坐标。
+ */
+static int64_t asr_stream_us_to_position_us(int64_t stream_us, int64_t start_time, int no_time_adjust)
+{
+    if (stream_us == AV_NOPTS_VALUE || no_time_adjust)
+        return stream_us;
+    if (start_time > 0 && start_time != AV_NOPTS_VALUE)
+        stream_us -= start_time;
+    return stream_us < 0 ? 0 : stream_us;
+}
+
+/* 调用方持有 tap->mutex（或线程未启动 / 已退出） */
+static void asr_tap_free_packets_l(FFAsrPacketTap *tap)
+{
+    AsrTapPacket *node = tap->first_pkt;
+    while (node) {
+        AsrTapPacket *next = node->next;
+        av_packet_free(&node->pkt);
+        av_free(node);
+        node = next;
+    }
+    tap->first_pkt = NULL;
+    tap->last_pkt = NULL;
+    tap->nb_packets = 0;
+    tap->bytes = 0;
+    tap->duration_us = 0;
+}
+
+/* 线程未启动或已 join 之后才调用 */
+static void asr_tap_free(FFAsrPacketTap *tap)
+{
+    if (!tap)
+        return;
+    asr_tap_free_packets_l(tap);
+    avcodec_free_context(&tap->avctx);
+    swr_free(&tap->swr);
+    av_freep(&tap->conv_buf);
+    av_freep(&tap->chunk);
+    SDL_DestroyCond(tap->cond);
+    SDL_DestroyMutex(tap->mutex);
+    av_free(tap);
+}
+
+/* 换代：丢掉解码器、重采样器和未凑满的一包里残留的旧样本 */
+static void asr_tap_reset_output(FFAsrPacketTap *tap)
+{
+    avcodec_flush_buffers(tap->avctx);
+    swr_free(&tap->swr);
+    tap->chunk_samples = 0;
+    tap->chunk_pts_us = AV_NOPTS_VALUE;
+    tap->next_pts_us = AV_NOPTS_VALUE;
+}
+
+static int asr_tap_serial_current(FFAsrPacketTap *tap, int serial)
+{
+    int current;
+    SDL_LockMutex(tap->mutex);
+    current = !tap->abort_request && tap->serial == serial;
+    SDL_UnlockMutex(tap->mutex);
+    return current;
+}
+
+static int asr_tap_ensure_swr(FFAsrPacketTap *tap, const AVFrame *frame)
+{
+    AVChannelLayout in_layout = { 0 };
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+    int ret;
+
+    if (tap->swr &&
+        tap->swr_in_rate == frame->sample_rate &&
+        tap->swr_in_channels == frame->ch_layout.nb_channels &&
+        tap->swr_in_format == frame->format)
+        return 0;
+    swr_free(&tap->swr);
+    if (av_channel_layout_check(&frame->ch_layout)) {
+        ret = av_channel_layout_copy(&in_layout, &frame->ch_layout);
+    } else {
+        av_channel_layout_default(&in_layout, frame->ch_layout.nb_channels);
+        ret = 0;
+    }
+    if (ret >= 0)
+        ret = swr_alloc_set_opts2(&tap->swr,
+                                  &out_layout, AV_SAMPLE_FMT_S16, ASR_TAP_SAMPLE_RATE,
+                                  &in_layout, frame->format, frame->sample_rate,
+                                  0, NULL);
+    av_channel_layout_uninit(&in_layout);
+    if (ret < 0 || swr_init(tap->swr) < 0) {
+        swr_free(&tap->swr);
+        if (!tap->swr_error_logged) {
+            tap->swr_error_logged = 1;
+            av_log(NULL, AV_LOG_ERROR, "[ASR] packet tap swr init failed\n");
+        }
+        return -1;
+    }
+    tap->swr_in_rate = frame->sample_rate;
+    tap->swr_in_channels = frame->ch_layout.nb_channels;
+    tap->swr_in_format = frame->format;
+    return 0;
+}
+
+/* 凑满一包：帧头写 PTS，经采样回调送出；没装采样回调（App 没在听）时不送 */
+static void asr_tap_send_chunk(FFAsrPacketTap *tap)
+{
+    ijk_audio_samples_callback callback = tap->ffp->audio_samples_callback;
+    uint64_t pts = (uint64_t) tap->chunk_pts_us;
+    int i;
+
+    if (!callback)
+        return;
+    for (i = 0; i < ASR_TAP_PTS_WORDS; i++)
+        tap->chunk[i] = (int16_t) ((pts >> (16 * i)) & 0xFFFF);
+    callback(tap->ffp->inject_opaque, tap->chunk,
+             (ASR_TAP_PTS_WORDS + tap->chunk_samples) * (int) sizeof(int16_t),
+             ASR_TAP_SAMPLE_RATE, FS_ASR_PACKET_TAP_CHANNELS);
+}
+
+static void asr_tap_emit_frame(FFAsrPacketTap *tap, AVFrame *frame, int serial)
+{
+    int64_t pts_us;
+    int out_max;
+    int got;
+    int offset = 0;
+    uint8_t *out;
+
+    if (frame->nb_samples <= 0 || frame->sample_rate <= 0)
+        return;
+    if (asr_tap_ensure_swr(tap, frame) < 0)
+        return;
+
+    /* 解码器输出的 frame->pts 在 pkt_timebase（码流 time_base）上；没有时按上一帧外推 */
+    pts_us = frame->pts != AV_NOPTS_VALUE
+             ? av_rescale_q(frame->pts, tap->time_base, AV_TIME_BASE_Q)
+             : tap->next_pts_us;
+    if (pts_us != AV_NOPTS_VALUE)
+        tap->next_pts_us = pts_us + av_rescale(frame->nb_samples, AV_TIME_BASE, frame->sample_rate);
+    pts_us = asr_stream_us_to_position_us(pts_us, tap->start_time, tap->no_time_adjust);
+
+    out_max = swr_get_out_samples(tap->swr, frame->nb_samples);
+    if (out_max <= 0)
+        return;
+    av_fast_malloc(&tap->conv_buf, &tap->conv_buf_size, (size_t) out_max * 2);
+    if (!tap->conv_buf)
+        return;
+    out = tap->conv_buf;
+    got = swr_convert(tap->swr, &out, out_max,
+                      (const uint8_t **) frame->extended_data, frame->nb_samples);
+    if (got <= 0)
+        return;
+
+    while (offset < got) {
+        int n = FFMIN(got - offset, ASR_TAP_CHUNK_SAMPLES - tap->chunk_samples);
+        if (tap->chunk_samples == 0)
+            tap->chunk_pts_us = pts_us == AV_NOPTS_VALUE
+                                ? AV_NOPTS_VALUE
+                                : pts_us + av_rescale(offset, AV_TIME_BASE, ASR_TAP_SAMPLE_RATE);
+        memcpy(tap->chunk + ASR_TAP_PTS_WORDS + tap->chunk_samples,
+               tap->conv_buf + (size_t) offset * 2, (size_t) n * 2);
+        tap->chunk_samples += n;
+        offset += n;
+        if (tap->chunk_samples >= ASR_TAP_CHUNK_SAMPLES) {
+            /* seek 之后还在解的旧代数据不送：上层已经按新位置清空了 */
+            if (tap->chunk_pts_us != AV_NOPTS_VALUE && asr_tap_serial_current(tap, serial))
+                asr_tap_send_chunk(tap);
+            tap->chunk_samples = 0;
+            tap->chunk_pts_us = AV_NOPTS_VALUE;
+        }
+    }
+}
+
+/* 旁路线程：采样回调里按需挂 JVM，线程退出时 SDL_RunThread 统一解除 */
+static int asr_packet_tap_thread(void *arg)
+{
+    FFAsrPacketTap *tap = arg;
+    AVFrame *frame = av_frame_alloc();
+    int decode_serial = -1;
+
+    if (!frame)
+        return AVERROR(ENOMEM);
+
+    for (;;) {
+        AsrTapPacket *node;
+
+        SDL_LockMutex(tap->mutex);
+        while (!tap->abort_request && !tap->first_pkt)
+            SDL_CondWait(tap->cond, tap->mutex);
+        if (tap->abort_request) {
+            SDL_UnlockMutex(tap->mutex);
+            break;
+        }
+        node = tap->first_pkt;
+        tap->first_pkt = node->next;
+        if (!tap->first_pkt)
+            tap->last_pkt = NULL;
+        tap->nb_packets--;
+        tap->bytes -= node->pkt->size;
+        tap->duration_us -= node->duration_us;
+        SDL_UnlockMutex(tap->mutex);
+
+        if (node->serial != decode_serial) {
+            asr_tap_reset_output(tap);
+            decode_serial = node->serial;
+        }
+        if (avcodec_send_packet(tap->avctx, node->pkt) >= 0) {
+            while (avcodec_receive_frame(tap->avctx, frame) >= 0) {
+                asr_tap_emit_frame(tap, frame, decode_serial);
+                av_frame_unref(frame);
+            }
+        }
+        av_packet_free(&node->pkt);
+        av_free(node);
+    }
+
+    av_frame_free(&frame);
+    return 0;
+}
+
+/* 音频组件打开后调用（读线程或选轨的调用线程）；AV3A、无解码器、打开失败时不出旁路 */
+static void asr_packet_tap_open(FFPlayer *ffp, int stream_index)
+{
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = is ? is->ic : NULL;
+    AVStream *st;
+    const AVCodec *codec = NULL;
+    AVDictionary *opts = NULL;
+    FFAsrPacketTap *tap;
+
+    if (!ffp->asr_packet_tap_enabled || !ffp->asr_packet_tap_mutex || !ic ||
+        stream_index < 0 || stream_index >= ic->nb_streams)
+        return;
+    asr_packet_tap_close(ffp);
+
+    st = ic->streams[stream_index];
+    /* AV3A 解码很重，再解一份负担不起：不出旁路，上层等不到帧会改用其他领先来源 */
+    if (st->codecpar->codec_id == AV_CODEC_ID_AVS3DA) {
+        av_log(ffp, AV_LOG_INFO, "[ASR] packet tap skipped for av3a\n");
+        return;
+    }
+    if (ffp->audio_codec_name)
+        codec = avcodec_find_decoder_by_name(ffp->audio_codec_name);
+    if (!codec)
+        codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        av_log(ffp, AV_LOG_WARNING, "[ASR] packet tap: no decoder for %s\n",
+               avcodec_get_name(st->codecpar->codec_id));
+        return;
+    }
+
+    tap = av_mallocz(sizeof(*tap));
+    if (!tap)
+        return;
+    tap->ffp = ffp;
+    tap->time_base = st->time_base;
+    tap->start_time = ic->start_time;
+    tap->no_time_adjust = ffp->no_time_adjust;
+    tap->fallback_pkt_us = (st->codecpar->frame_size > 0 && st->codecpar->sample_rate > 0)
+                           ? av_rescale(st->codecpar->frame_size, AV_TIME_BASE,
+                                        st->codecpar->sample_rate)
+                           : ASR_TAP_FALLBACK_PKT_US;
+    tap->chunk_pts_us = AV_NOPTS_VALUE;
+    tap->next_pts_us = AV_NOPTS_VALUE;
+    tap->mutex = SDL_CreateMutex();
+    tap->cond = SDL_CreateCond();
+    tap->chunk = av_malloc((ASR_TAP_PTS_WORDS + ASR_TAP_CHUNK_SAMPLES) * sizeof(int16_t));
+    tap->avctx = avcodec_alloc_context3(NULL);
+    if (!tap->mutex || !tap->cond || !tap->chunk || !tap->avctx ||
+        avcodec_parameters_to_context(tap->avctx, st->codecpar) < 0)
+        goto fail;
+    tap->avctx->pkt_timebase = st->time_base;
+    tap->avctx->codec_id = codec->id;
+
+    /* 与可见解码器同一套解码选项（按解码器过滤），线程固定 1 个 */
+    if (filter_codec_opts(ffp->codec_opts, codec->id, ic, st, codec, &opts, NULL) < 0)
+        goto fail;
+    av_dict_set(&opts, "threads", "1", 0);
+    if (avcodec_open2(tap->avctx, codec, &opts) < 0) {
+        av_log(ffp, AV_LOG_WARNING, "[ASR] packet tap: open %s failed\n", codec->name);
+        goto fail;
+    }
+    av_dict_free(&opts);
+
+    tap->thread = SDL_CreateThreadEx(&tap->_thread, asr_packet_tap_thread, tap, "ff_asr_tap");
+    if (!tap->thread)
+        goto fail;
+
+    SDL_LockMutex(ffp->asr_packet_tap_mutex);
+    ffp->asr_packet_tap = tap;
+    SDL_UnlockMutex(ffp->asr_packet_tap_mutex);
+    av_log(ffp, AV_LOG_INFO, "[ASR] packet tap started (%s)\n", codec->name);
+    return;
+
+fail:
+    av_dict_free(&opts);
+    asr_tap_free(tap);
+}
+
+/* 随音频组件关闭、播放器销毁；先摘下指针（读线程此后看不到它），再停线程、释放 */
+static void asr_packet_tap_close(FFPlayer *ffp)
+{
+    FFAsrPacketTap *tap;
+
+    if (!ffp->asr_packet_tap_mutex)
+        return;
+    SDL_LockMutex(ffp->asr_packet_tap_mutex);
+    tap = ffp->asr_packet_tap;
+    ffp->asr_packet_tap = NULL;
+    SDL_UnlockMutex(ffp->asr_packet_tap_mutex);
+    if (!tap)
+        return;
+
+    SDL_LockMutex(tap->mutex);
+    tap->abort_request = 1;
+    SDL_CondSignal(tap->cond);
+    SDL_UnlockMutex(tap->mutex);
+    SDL_WaitThread(tap->thread, NULL);
+    asr_tap_free(tap);
+}
+
+/* 读线程：音频包入 audioq 前调用（packet_queue_put 会把包移走），只做引用 + 入队，不阻塞 */
+static void asr_packet_tap_put(FFPlayer *ffp, const AVPacket *pkt)
+{
+    FFAsrPacketTap *tap;
+
+    if (!ffp->asr_packet_tap_enabled || !ffp->asr_packet_tap_mutex ||
+        !pkt || !pkt->data || pkt->size <= 0)
+        return;
+    SDL_LockMutex(ffp->asr_packet_tap_mutex);
+    tap = ffp->asr_packet_tap;
+    if (tap) {
+        AsrTapPacket *node = av_mallocz(sizeof(*node));
+        if (node)
+            node->pkt = av_packet_alloc();
+        if (node && node->pkt && av_packet_ref(node->pkt, pkt) >= 0) {
+            node->duration_us = pkt->duration > 0
+                                ? av_rescale_q(pkt->duration, tap->time_base, AV_TIME_BASE_Q)
+                                : tap->fallback_pkt_us;
+            SDL_LockMutex(tap->mutex);
+            node->serial = tap->serial;
+            if (tap->last_pkt)
+                tap->last_pkt->next = node;
+            else
+                tap->first_pkt = node;
+            tap->last_pkt = node;
+            tap->nb_packets++;
+            tap->bytes += node->pkt->size;
+            tap->duration_us += node->duration_us;
+            /* 旁路跟不上（抢不到 CPU、回调慢）时丢最旧的，绝不让读线程等 */
+            while (tap->nb_packets > 1 &&
+                   (tap->duration_us > ASR_TAP_MAX_QUEUE_US ||
+                    tap->nb_packets > ASR_TAP_MAX_QUEUE_PACKETS ||
+                    tap->bytes > ASR_TAP_MAX_QUEUE_BYTES)) {
+                AsrTapPacket *oldest = tap->first_pkt;
+                tap->first_pkt = oldest->next;
+                tap->nb_packets--;
+                tap->bytes -= oldest->pkt->size;
+                tap->duration_us -= oldest->duration_us;
+                av_packet_free(&oldest->pkt);
+                av_free(oldest);
+            }
+            SDL_CondSignal(tap->cond);
+            SDL_UnlockMutex(tap->mutex);
+        } else if (node) {
+            av_packet_free(&node->pkt);
+            av_free(node);
+        }
+    }
+    SDL_UnlockMutex(ffp->asr_packet_tap_mutex);
+}
+
+/* seek / 不连续：与 audioq 一起清空并换代，旁路线程见到新代的包时冲掉解码器状态 */
+static void asr_packet_tap_flush(FFPlayer *ffp)
+{
+    FFAsrPacketTap *tap;
+
+    if (!ffp->asr_packet_tap_enabled || !ffp->asr_packet_tap_mutex)
+        return;
+    SDL_LockMutex(ffp->asr_packet_tap_mutex);
+    tap = ffp->asr_packet_tap;
+    if (tap) {
+        SDL_LockMutex(tap->mutex);
+        asr_tap_free_packets_l(tap);
+        tap->serial++;
+        SDL_UnlockMutex(tap->mutex);
+    }
+    SDL_UnlockMutex(ffp->asr_packet_tap_mutex);
+}
+
 /* open a given stream. Return 0 if OK */
 static int stream_component_open(FFPlayer *ffp, int stream_index)
 {
@@ -3997,6 +4453,7 @@ retry_android_software:
                 goto out;
             SDL_AoutPauseAudio(ffp->aout, 0);
             _ijkmeta_set_stream(ffp, avctx->codec_type, stream_index);
+            asr_packet_tap_open(ffp, stream_index);
         }
         break;
     case AVMEDIA_TYPE_VIDEO:
@@ -4528,8 +4985,10 @@ static int read_thread(void *arg)
                 av_log(NULL, AV_LOG_ERROR,
                        "%s: error while seeking\n", is->ic->url);
             } else {
-                if (is->audio_stream >= 0)
+                if (is->audio_stream >= 0) {
                     packet_queue_flush(&is->audioq);
+                    asr_packet_tap_flush(ffp);
+                }
                 if (is->video_stream >= 0) {
                     if (ffp->node_vdec) {
                         ffpipenode_flush(ffp->node_vdec);
@@ -4765,6 +5224,7 @@ static int read_thread(void *arg)
                 #warning TESTME
                 if (is->audio_stream >= 0) {
                     is->audioq.serial++;
+                    asr_packet_tap_flush(ffp);
                     //packet_queue_put(&is->audioq, &flush_pkt);
                 }
                 if (is->video_stream >= 0) {
@@ -4872,6 +5332,7 @@ static int read_thread(void *arg)
                 } else {
                     int stream_index = pkt->stream_index;
                     if (stream_index == is->audio_stream) {
+                        asr_packet_tap_put(ffp, pkt);
                         packet_queue_put(&is->audioq, pkt);
                     } else if (stream_index == is->video_stream
                                && !(is->video_st && (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC))) {
@@ -5304,6 +5765,7 @@ FFPlayer *ffp_create(void)
 #if CONFIG_VIDEO_AVFILTER
     ffp->vf_mutex = SDL_CreateMutex();
 #endif
+    ffp->asr_packet_tap_mutex = SDL_CreateMutex();
     ffp->av_class = &ffp_context_class;
     ffp->meta = ijkmeta_create();
 
@@ -5349,8 +5811,10 @@ void ffp_destroy(FFPlayer *ffp)
     ffpipenode_free_p(&ffp->node_vdec);
     ffpipeline_free_p(&ffp->pipeline);
     ijkmeta_destroy_p(&ffp->meta);
+    asr_packet_tap_close(ffp);
 
     ffp_reset_internal(ffp);
+    SDL_DestroyMutexP(&ffp->asr_packet_tap_mutex);
 
     msg_queue_destroy(&ffp->msg_queue);
 

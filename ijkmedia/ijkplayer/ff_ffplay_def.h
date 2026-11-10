@@ -79,6 +79,8 @@
 #define DEFAULT_FIRST_HIGH_WATER_MARK_IN_MS     (100)
 #define DEFAULT_NEXT_HIGH_WATER_MARK_IN_MS      (1 * 1000)
 #define DEFAULT_LAST_HIGH_WATER_MARK_IN_MS      (5 * 1000)
+/* 水位选项上限：领先字幕起播缓冲要到「提前量 + 500 ms」（提前量最多 10 s），默认 5 s 的上限不够 */
+#define MAX_HIGH_WATER_MARK_IN_MS               (60 * 1000)
 
 #define BUFFERING_CHECK_PER_BYTES               (512)
 #define BUFFERING_CHECK_PER_MILLISECONDS        (500)
@@ -501,6 +503,7 @@ inline static void ffp_reset_demux_cache_control(FFDemuxCacheControl *dcc)
 /* ffplayer */
 struct IjkMediaMeta;
 struct FS_Pipeline;
+struct FFAsrPacketTap;
 typedef struct FFPlayer {
     const AVClass *av_class;
 
@@ -642,6 +645,10 @@ typedef struct FFPlayer {
     int render_wait_start;
 
     ijk_audio_samples_callback audio_samples_callback;
+    /* ---- ASR 包级旁路（asr-packet-tap）：读线程入队的音频包另解一份，经采样回调送领先识别 ---- */
+    int asr_packet_tap_enabled;
+    SDL_mutex *asr_packet_tap_mutex;     /* 保护 asr_packet_tap 指针；ffp_create 建、ffp_destroy 销毁 */
+    struct FFAsrPacketTap *asr_packet_tap;
     
     FSSubtitlePreference sp;
 
@@ -787,6 +794,8 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->mediacodec_default_name        = NULL; // option
     ffp->ijkmeta_delay_init             = 0; // option
     ffp->render_wait_start              = 0;
+    ffp->asr_packet_tap_enabled         = 0; // option
+    ffp->asr_packet_tap                 = NULL; /* 随音频组件关闭；mutex 不在这里重置 */
 
     ijkmeta_reset(ffp->meta);
 
