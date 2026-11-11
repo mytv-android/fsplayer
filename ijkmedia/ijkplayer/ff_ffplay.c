@@ -4633,11 +4633,15 @@ static int decode_interrupt_cb(void *ctx)
 
     if (is->abort_request)
         return 1;
-    if (is->probe_early_exit_active && probe_primary_tracks_ready(is)) {
-        /* 只中断这一次探测：播放阶段的读取不能再被它打断 */
-        is->probe_early_exit_active = 0;
-        is->probe_early_exit_requested = 1;
-        return 1;
+    if (is->probe_early_exit_active) {
+        if (probe_primary_tracks_ready(is)) {
+            /* 只中断这一次探测：播放阶段的读取不能再被它打断 */
+            is->probe_early_exit_active = 0;
+            is->probe_early_exit_requested = 1;
+            av_log(NULL, AV_LOG_INFO,
+                   "probe early exit: primary audio/video tracks are ready\n");
+            return 1;
+        }
     }
     return 0;
 }
