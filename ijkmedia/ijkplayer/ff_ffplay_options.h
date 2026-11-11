@@ -102,6 +102,9 @@ static const AVOption ffp_context_options[] = {
     { "find_stream_info",               "read and decode the streams to fill missing information with heuristics" ,
         OPTION_OFFSET(find_stream_info),    OPTION_INT(1, 0, 1) },
 
+    { "probe-early-exit",               "stop stream probing once the primary audio/video tracks are decodable",
+        OPTION_OFFSET(probe_early_exit),    OPTION_INT(0, 0, 1) },
+
     // extended options in ff_ffplay.c
     { "deinterlace",                    "enable deinterlace,only software decoding effective (0: disabled, 1: bwdif, 2: yadif, 3: field)",
         OPTION_OFFSET(deinterlace),     OPTION_INT(0, 0, 3) },

@@ -45,6 +45,7 @@
 #include "libavutil/bprint.h"
 #include "libavutil/buffer.h"
 #include "libavformat/avformat.h"
+#include "libavformat/internal.h"
 #if defined(__ANDROID__)
 #include "libavcodec/mediacodec.h"
 #endif
@@ -4558,10 +4559,87 @@ out:
     return ret;
 }
 
+/**
+ * MARK 首路流是否已具备打开解码器所需的参数
+ * 探测期间参数写在 FFStream.avctx 上（find_stream_info 收尾才回填 codecpar），这里直接看 avctx。
+ */
+static int probe_track_ready(const AVStream *st) {
+    const FFStream *sti = cffstream(st);
+    const AVCodecParameters *par = st->codecpar;
+    const AVCodecContext *avctx = sti->avctx;
+
+    if (!par || !avctx || par->codec_id == AV_CODEC_ID_NONE)
+        return 0;
+
+    switch (par->codec_type) {
+    case AVMEDIA_TYPE_VIDEO:
+        if (avctx->width <= 0 || avctx->height <= 0)
+            return 0;
+        switch (par->codec_id) {
+        case AV_CODEC_ID_H264:
+        case AV_CODEC_ID_HEVC:
+        case AV_CODEC_ID_AV1:
+        case AV_CODEC_ID_VP9:
+            /* MediaCodec 在 configure 时需要 SPS/PPS（extradata） */
+            return avctx->extradata_size > 0;
+        default:
+            return 1;
+        }
+    case AVMEDIA_TYPE_AUDIO:
+        return avctx->sample_rate > 0 && avctx->ch_layout.nb_channels > 0;
+    default:
+        return 0;
+    }
+}
+
+/**
+ * MARK 首路视频 + 全部音轨是否都可解码；字幕/图文等声明但迟到的流不参与判定
+ */
+static int probe_primary_tracks_ready(VideoState *is) {
+    AVFormatContext *ic = is->ic;
+    int video_seen = 0, video_ready = 0;
+    int audio_seen = 0, audio_pending = 0;
+    unsigned i;
+
+    if (!ic)
+        return 0;
+
+    for (i = 0; i < ic->nb_streams; i++) {
+        const AVStream *st = ic->streams[i];
+        if (!st || !st->codecpar)
+            continue;
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_seen = 1;
+            video_ready |= probe_track_ready(st);
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audio_seen = 1;
+            if (!probe_track_ready(st))
+                audio_pending = 1;
+        }
+    }
+
+    if (!video_seen && !audio_seen)
+        return 0;
+    if (video_seen && !video_ready)
+        return 0;
+    if (audio_seen && audio_pending)
+        return 0;
+    return 1;
+}
+
 static int decode_interrupt_cb(void *ctx)
 {
     VideoState *is = ctx;
-    return is->abort_request;
+
+    if (is->abort_request)
+        return 1;
+    if (is->probe_early_exit_active && probe_primary_tracks_ready(is)) {
+        /* 只中断这一次探测：播放阶段的读取不能再被它打断 */
+        is->probe_early_exit_active = 0;
+        is->probe_early_exit_requested = 1;
+        return 1;
+    }
+    return 0;
 }
 
 static int stream_has_enough_packets(AVStream *st, int stream_id, PacketQueue *queue, int min_frames) {
@@ -4726,6 +4804,8 @@ static int read_thread(void *arg)
             ret = err;
             goto fail;
         }
+        is->probe_early_exit_active = ffp->probe_early_exit ? 1 : 0;
+        is->probe_early_exit_requested = 0;
         do {
             if (av_stristart(is->filename, "data:", NULL) && orig_nb_streams > 0) {
                 for (i = 0; i < orig_nb_streams; i++) {
@@ -4740,11 +4820,20 @@ static int read_thread(void *arg)
             }
             err = avformat_find_stream_info(ic, opts);
         } while(0);
+        is->probe_early_exit_active = 0;
         ffp_notify_msg1(ffp, FFP_MSG_FIND_STREAM_INFO);
 
         for (i = 0; i < orig_nb_streams; i++)
             av_dict_free(&opts[i]);
         av_freep(&opts);
+
+        /* 提前中断时后面的流可能没凑齐，find_stream_info 会返回负值，但音视频参数已经够开播；
+         * 收尾阶段仍会把 avctx 参数回填 codecpar，不能当成流信息失败 */
+        if (err < 0 && is->probe_early_exit_requested && !is->abort_request) {
+            av_log(ffp, AV_LOG_INFO,
+                   "probe early exit: primary audio/video tracks are ready\n");
+            err = 0;
+        }
 
         if (err < 0) {
             av_log(NULL, AV_LOG_WARNING,

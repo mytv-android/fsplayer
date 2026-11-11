@@ -299,6 +299,8 @@ typedef struct VideoState {
     SDL_Thread _read_tid;
     const AVInputFormat *iformat;
     int abort_request;
+    int probe_early_exit_active;
+    int probe_early_exit_requested;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
     int force_refresh_pic;//changed sub prefercence or close sub.
     int force_refresh;
@@ -548,6 +550,7 @@ typedef struct FFPlayer {
     int autorotate;
     int max_audio_output_channels;
     int find_stream_info;
+    int probe_early_exit;
     unsigned sws_flags;
 
     int64_t audio_callback_time;
@@ -728,6 +731,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     
     ffp->autorotate             = 1;
     ffp->find_stream_info       = 1;
+    ffp->probe_early_exit       = 0; // option
 
     ffp->sws_flags              = SWS_FAST_BILINEAR;
 
