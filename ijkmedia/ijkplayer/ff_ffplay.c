@@ -3290,7 +3290,7 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
     }
 }
 
-static int audio_open(FFPlayer *opaque, AVChannelLayout *wanted_channel_layout, int wanted_sample_rate, struct AudioParams *audio_hw_params)
+static int audio_open(FFPlayer *opaque, AVChannelLayout *wanted_channel_layout, int wanted_sample_rate, enum AVCodecID codec_id, struct AudioParams *audio_hw_params)
 {
     FFPlayer *ffp = opaque;
     VideoState *is = ffp->is;
@@ -3312,10 +3312,15 @@ static int audio_open(FFPlayer *opaque, AVChannelLayout *wanted_channel_layout, 
         av_channel_layout_default(wanted_channel_layout, wanted_nb_channels);
     }
     /* AV3A 声道数超过 sink 能力时钳制到 max-audio-output-channels，
-       aresample 会在 filter 重配时下混到 audio_tgt 布局 */
+       aresample 会在 filter 重配时下混到 audio_tgt 布局。
+       注意：audio_open 发生在 is->audio_st = st 之前，不能靠 is->audio_st 判别，
+       否则首次打开永远不钳制，多数电视会因 12 声道 AudioTrack 建不起来而整条音频
+       打不开、退化成 video master 快放。 */
     if (ffp->max_audio_output_channels > 0 &&
         wanted_channel_layout->nb_channels > ffp->max_audio_output_channels &&
-        is->audio_st && is->audio_st->codecpar->codec_id == AV_CODEC_ID_AVS3DA) {
+        codec_id == AV_CODEC_ID_AVS3DA) {
+        av_log(ffp, AV_LOG_INFO, "AV3A channel clamp: %d -> %d (sink max)\n",
+               wanted_channel_layout->nb_channels, ffp->max_audio_output_channels);
         av_channel_layout_uninit(wanted_channel_layout);
         av_channel_layout_default(wanted_channel_layout, ffp->max_audio_output_channels);
         if (wanted_channel_layout->order == AV_CHANNEL_ORDER_NATIVE)
@@ -4428,7 +4433,7 @@ retry_android_software:
                 goto fail;
     #endif
             /* prepare audio output */
-            if ((ret = audio_open(ffp, &ch_layout, sample_rate, &is->audio_tgt)) < 0)
+            if ((ret = audio_open(ffp, &ch_layout, sample_rate, st->codecpar->codec_id, &is->audio_tgt)) < 0)
                 goto fail;
             is->audio_hw_buf_size = ret;
             is->audio_src = is->audio_tgt;
@@ -4862,6 +4867,8 @@ static int read_thread(void *arg)
     
     //when open audio stream failed or no audio stream use video as av sync master.
     if (ret || st_index[AVMEDIA_TYPE_AUDIO] == -1) {
+        av_log(ffp, AV_LOG_WARNING,
+               "audio stream open failed (or absent), fallback to video-master sync; playback will run without audio pacing\n");
         ffp->av_sync_type = AV_SYNC_VIDEO_MASTER;
         is->av_sync_type  = ffp->av_sync_type;
     }
