@@ -349,7 +349,8 @@ static int ijkmp_set_data_source_l(IjkMediaPlayer *mp, const char *url)
     MPST_RET_IF_EQ(mp->mp_state, MP_STATE_STARTED);
     MPST_RET_IF_EQ(mp->mp_state, MP_STATE_PAUSED);
     MPST_RET_IF_EQ(mp->mp_state, MP_STATE_COMPLETED);
-    MPST_RET_IF_EQ(mp->mp_state, MP_STATE_STOPPED);
+    // 换台可以停在 STOPPED 状态改源：保住播放器与渲染器，MediaCodec 才能被复用。
+    // MPST_RET_IF_EQ(mp->mp_state, MP_STATE_STOPPED);
     MPST_RET_IF_EQ(mp->mp_state, MP_STATE_ERROR);
     MPST_RET_IF_EQ(mp->mp_state, MP_STATE_END);
 
@@ -532,6 +533,12 @@ static int ijkmp_stop_l(IjkMediaPlayer *mp)
     if (retval < 0) {
         return retval;
     }
+
+    // 停掉后把流收干净（不销毁 vout/渲染器），这样下一次 setDataSource + prepareAsync
+    // 才能直接建新流。保留 vout 是 MediaCodec 复用的前提：Surface 不变，解码器实例才
+    // 能在池里命中；reset() 会把整棵树都拆掉。
+    ffp_wait_stop_l(mp->ffplayer);
+
     return 0;
 }
 
