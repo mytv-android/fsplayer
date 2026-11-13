@@ -3501,3 +3501,16 @@ jobject fs_vulkan_renderer_get_mediacodec_surface(JNIEnv *env, FSVulkanRenderer 
 
     return SDL_AndroidImageReader_getSurface(env, r->mc_reader);
 }
+
+/* 解码流的色彩属性交给读端窗口（ANativeWindow_setBuffersDataSpace）。
+   不设置时 MediaCodec 输出到 AImageReader 的数据空间未定义：高通 c2 解码器在
+   4K 10bit HDR 上会按 8bit sRGB 排布缓冲，读端按 P010 采样就整屏绿色 + 水平条纹。 */
+void fs_vulkan_renderer_set_mc_color_space(FSVulkanRenderer *r, int bit_depth,
+                                           int primaries, int transfer, int matrix)
+{
+    if (!r || !r->mc_reader)
+        return;
+
+    SDL_AndroidImageReader_setBufferDataSpace(r->mc_reader, bit_depth,
+                                              primaries, transfer, matrix);
+}

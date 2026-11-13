@@ -71,6 +71,10 @@ int SDL_VoutAndroid_IsOpenGLES3(SDL_Vout *vout);
  */
 jobject SDL_VoutAndroid_GetMediaCodecSurface(JNIEnv *env, SDL_Vout *vout);
 
+/* 把解码流的色彩属性转给硬解读端窗口，须在 MediaCodec 开始输出前调用。 */
+void SDL_VoutAndroid_SetMediaCodecColorSpace(SDL_Vout *vout, int bit_depth,
+                                             int primaries, int transfer, int matrix);
+
 /*
  * 返回字幕用的 SDL_GPU（和渲染器共用 Vulkan device）。
  *

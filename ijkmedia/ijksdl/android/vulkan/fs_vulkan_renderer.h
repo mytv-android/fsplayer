@@ -140,6 +140,9 @@ int fs_vulkan_renderer_is_mediacodec_supported(FSVulkanRenderer *r);
 
 /* 返回 AImageReader 的输出 Surface（NewLocalRef，调用方 DeleteLocalRef）。 */
 jobject fs_vulkan_renderer_get_mediacodec_surface(JNIEnv *env, FSVulkanRenderer *r);
+/* 声明读端 buffer 的色彩空间，须在 MediaCodec 开始输出前调用。 */
+void fs_vulkan_renderer_set_mc_color_space(FSVulkanRenderer *r, int bit_depth,
+                                           int primaries, int transfer, int matrix);
 
 void fs_vulkan_renderer_destroy(FSVulkanRenderer *r);
 

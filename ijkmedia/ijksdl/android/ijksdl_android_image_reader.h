@@ -49,6 +49,20 @@ bool SDL_AndroidImageReader_isAvailable(void);
 SDL_AndroidImageReader *SDL_AndroidImageReader_create(int max_images);
 
 /*
+ * 声明这块读端 buffer 的色彩空间（ANativeWindow_setBuffersDataSpace）。
+ *
+ * 不设时 MediaCodec 输出到这个窗口的数据空间是未定义的，部分驱动（例如高通的
+ * c2 解码器输出 4K 10bit HDR）会按默认的 8bit sRGB 布局填充，读端按 P010 采样
+ * 就得到整屏绿色 + 水平条纹。bit_depth 为 8/10/12，primaries/transfer/matrix
+ * 用 AVColorPrimaries / AVColorTransferCharacteristic / AVColorSpace 的取值
+ * （-1 / AVCOL_*_UNSPECIFIED 表示未知，按 SDR 处理）。
+ * 需要在 MediaCodec 开始输出前调用；返回 0 表示已设置。
+ */
+int SDL_AndroidImageReader_setBufferDataSpace(SDL_AndroidImageReader *r,
+                                              int bit_depth,
+                                              int primaries, int transfer, int matrix);
+
+/*
  * 取 reader 的输出 Surface（返回 NewLocalRef，调用方负责 DeleteLocalRef）。
  * 该 Surface 交给 MediaCodec 作为输出目标。
  */

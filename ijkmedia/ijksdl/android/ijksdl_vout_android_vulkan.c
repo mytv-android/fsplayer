@@ -742,6 +742,18 @@ jobject SDL_VoutAndroid_GetMediaCodecSurface(JNIEnv *env, SDL_Vout *vout)
     return fs_vulkan_renderer_get_mediacodec_surface(env, vout->opaque->renderer);
 }
 
+/* 把解码流的色彩属性转给读端窗口。必须在 MediaCodec 开始输出前调用，否则驱动已按
+   默认 8bit sRGB 布局排好缓冲，读端按 P010 采样会得到整屏绿色 + 水平条纹。 */
+void SDL_VoutAndroid_SetMediaCodecColorSpace(SDL_Vout *vout, int bit_depth,
+                                             int primaries, int transfer, int matrix)
+{
+    if (!vout || !vout->opaque || vout->opaque->gles)
+        return;
+
+    fs_vulkan_renderer_set_mc_color_space(vout->opaque->renderer,
+                                          bit_depth, primaries, transfer, matrix);
+}
+
 SDL_GPU *SDL_VoutAndroid_GetGPU(SDL_Vout *vout)
 {
     if (!vout || !vout->opaque)

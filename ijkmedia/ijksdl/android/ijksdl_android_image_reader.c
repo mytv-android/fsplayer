@@ -29,6 +29,7 @@
 #include <pthread.h>
 
 #include <android/hardware_buffer.h>
+#include <android/data_space.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <media/NdkImage.h>
@@ -37,11 +38,14 @@
 #include "../ijksdl_log.h"
 #include "../ijksdl_mutex.h"
 
+#include "libavutil/pixfmt.h"
+
 /* ---- libmediandk 延迟符号解析 ------------------------------------------- */
 
 typedef media_status_t (*fp_AImageReader_newWithUsage)(int32_t, int32_t, int32_t,
                                                        uint64_t, int32_t, AImageReader **);
 typedef media_status_t (*fp_AImageReader_getWindow)(AImageReader *, ANativeWindow **);
+typedef int32_t (*fp_ANativeWindow_setBuffersDataSpace)(ANativeWindow *, int32_t);
 typedef media_status_t (*fp_AImageReader_setImageListener)(AImageReader *,
                                                            AImageReader_ImageListener *);
 typedef media_status_t (*fp_AImageReader_acquireLatestImage)(AImageReader *, AImage **);
@@ -209,6 +213,55 @@ SDL_AndroidImageReader *SDL_AndroidImageReader_create(int max_images)
 
     ALOGI("ijimage: reader created, max_images=%d\n", max_images);
     return r;
+}
+
+/* AVColorPrimaries / AVColorTransferCharacteristic -> ADATASPACE_*。
+   只挑 NDK 公开的几档；未识别的按 SDR(BT709) 处理。 */
+static int sdl_dataspace_from_av(int bit_depth, int primaries, int transfer, int matrix)
+{
+    (void) matrix;
+
+    if (primaries == AVCOL_PRI_BT2020 || (bit_depth > 8 && primaries < 0)) {
+        if (transfer == AVCOL_TRC_SMPTE2084)
+            return ADATASPACE_BT2020_PQ;
+        if (transfer == AVCOL_TRC_ARIB_STD_B67)
+            return ADATASPACE_BT2020_HLG;
+        /* BT.2020 色域但传输未知：按 SDR 处理，读端仍按 10bit 采样 */
+        return ADATASPACE_BT2020;
+    }
+
+    return ADATASPACE_BT709;
+}
+
+int SDL_AndroidImageReader_setBufferDataSpace(SDL_AndroidImageReader *r,
+                                              int bit_depth,
+                                              int primaries, int transfer, int matrix)
+{
+    if (!r || !r->window)
+        return -1;
+
+    /* ANativeWindow_setBuffersDataSpace 是 API 28 才有的符号，FS minSdk 24，
+       与其余 mediandk 符号一样走 dlsym 延迟解析。 */
+    static fp_ANativeWindow_setBuffersDataSpace set_dataspace;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        set_dataspace = (fp_ANativeWindow_setBuffersDataSpace)
+            dlsym(RTLD_DEFAULT, "ANativeWindow_setBuffersDataSpace");
+        if (!set_dataspace && g_mc_lib.android_handle)
+            set_dataspace = (fp_ANativeWindow_setBuffersDataSpace)
+                dlsym(g_mc_lib.android_handle, "ANativeWindow_setBuffersDataSpace");
+    }
+    if (!set_dataspace) {
+        ALOGI("ijimage: ANativeWindow_setBuffersDataSpace unavailable\n");
+        return -1;
+    }
+
+    int dataspace = sdl_dataspace_from_av(bit_depth, primaries, transfer, matrix);
+    int ret = set_dataspace(r->window, dataspace);
+    ALOGI("ijimage: setBuffersDataSpace 0x%x (depth=%d pri=%d trc=%d) -> %d\n",
+          dataspace, bit_depth, primaries, transfer, ret);
+    return ret;
 }
 
 jobject SDL_AndroidImageReader_getSurface(JNIEnv *env, SDL_AndroidImageReader *r)

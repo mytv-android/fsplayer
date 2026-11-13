@@ -3550,6 +3550,37 @@ static int ffp_android_mediacodec_init(FFPlayer *ffp, AVCodecContext *avctx, con
     if (JNI_OK != SDL_JNI_SetupThreadEnv(&env))
         return -1;
 
+    /* 读端缓冲的色彩空间要在解码器开始输出前声明：FS 不是把 MediaCodec 直接接到
+       应用 SurfaceView（那样由 SurfaceFlinger 负责），而是接自建 AImageReader 再用
+       Vulkan 采样。不声明时缓冲的数据空间未定义，高通 c2 在 4K 10bit HDR 上会按
+       8bit sRGB 排布，读端按 P010 采样就整屏绿色 + 水平条纹。 */
+    int mc_bit_depth = 8;
+    switch (avctx->pix_fmt) {
+    case AV_PIX_FMT_YUV420P10LE:
+    case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_GRAY10LE:
+        mc_bit_depth = 10;
+        break;
+    case AV_PIX_FMT_YUV420P12LE:
+        mc_bit_depth = 12;
+        break;
+    default:
+        /* MediaCodec 硬解此时 pix_fmt 还没定，用 profile 推断 10bit（Main10 等） */
+        if (avctx->profile >= 0 && avctx->profile != AV_PROFILE_UNKNOWN &&
+            (avctx->codec_id == AV_CODEC_ID_HEVC
+                 ? avctx->profile == AV_PROFILE_HEVC_MAIN_10 ||
+                   avctx->profile == AV_PROFILE_HEVC_REXT
+                 : avctx->profile == AV_PROFILE_H264_HIGH_10 ||
+                   avctx->profile == AV_PROFILE_H264_HIGH_10_INTRA))
+            mc_bit_depth = 10;
+        break;
+    }
+    /* avctx 已由 avcodec_parameters_to_context 从流的 codecpar 拷好色彩字段。 */
+    SDL_VoutAndroid_SetMediaCodecColorSpace(ffp->vout, mc_bit_depth,
+                                            avctx->color_primaries,
+                                            avctx->color_trc,
+                                            avctx->colorspace);
+
     jobject surface = SDL_VoutAndroid_GetMediaCodecSurface(env, ffp->vout);
     if (!surface)
         return -1;
