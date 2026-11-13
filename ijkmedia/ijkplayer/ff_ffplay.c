@@ -755,16 +755,22 @@ static void stream_close(FFPlayer *ffp)
     packet_queue_abort(&is->audioq);
     ff_sub_abort(is->ffSub);
     SDL_WaitThread(is->read_tid, NULL);
+
+    /* 先等渲染线程退出再关解码器：renderer 还持有画面时关掉 MediaCodec，
+     * 硬件 buffer 回收不完（hw_buffer_count != 0），实例既不入复用池也不 stop，
+     * 设备上的 MediaCodec 实例随换台次数累积，触顶后新台配置失败就整条流退软解
+     * （HDR 内容随之只能色调映射，看起来像"HDR 突然不支持了"）。 */
+    av_log(NULL, AV_LOG_DEBUG, "wait for video_refresh_tid\n");
+    SDL_WaitThread(is->video_refresh_tid, NULL);
+
     /* close each stream */
     if (is->audio_stream >= 0)
         stream_component_close(ffp, is->audio_stream);
     if (is->video_stream >= 0)
         stream_component_close(ffp, is->video_stream);
-    
+
     avformat_close_input(&is->ic);
-    
-    av_log(NULL, AV_LOG_DEBUG, "wait for video_refresh_tid\n");
-    SDL_WaitThread(is->video_refresh_tid, NULL);
+
     ff_sub_destroy(&is->ffSub);
     
     packet_queue_destroy(&is->videoq);

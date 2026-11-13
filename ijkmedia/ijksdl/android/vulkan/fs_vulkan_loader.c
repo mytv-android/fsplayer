@@ -65,7 +65,6 @@ PFN_vkDestroySwapchainKHR fs_vkDestroySwapchainKHR;
 PFN_vkDeviceWaitIdle fs_vkDeviceWaitIdle;
 PFN_vkEndCommandBuffer fs_vkEndCommandBuffer;
 PFN_vkEnumerateDeviceExtensionProperties fs_vkEnumerateDeviceExtensionProperties;
-PFN_vkEnumerateInstanceExtensionProperties fs_vkEnumerateInstanceExtensionProperties;
 PFN_vkEnumeratePhysicalDevices fs_vkEnumeratePhysicalDevices;
 PFN_vkFreeDescriptorSets fs_vkFreeDescriptorSets;
 PFN_vkFreeMemory fs_vkFreeMemory;
@@ -212,8 +211,6 @@ static void load_vulkan(void)
     if (!fs_vkEndCommandBuffer) { ALOGW("FSVulkan: missing vkEndCommandBuffer\n"); return; }
     fs_vkEnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)dlsym(loader, "vkEnumerateDeviceExtensionProperties");
     if (!fs_vkEnumerateDeviceExtensionProperties) { ALOGW("FSVulkan: missing vkEnumerateDeviceExtensionProperties\n"); return; }
-    fs_vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)dlsym(loader, "vkEnumerateInstanceExtensionProperties");
-    if (!fs_vkEnumerateInstanceExtensionProperties) { ALOGW("FSVulkan: missing vkEnumerateInstanceExtensionProperties\n"); return; }
     fs_vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)dlsym(loader, "vkEnumeratePhysicalDevices");
     if (!fs_vkEnumeratePhysicalDevices) { ALOGW("FSVulkan: missing vkEnumeratePhysicalDevices\n"); return; }
     fs_vkFreeDescriptorSets = (PFN_vkFreeDescriptorSets)dlsym(loader, "vkFreeDescriptorSets");

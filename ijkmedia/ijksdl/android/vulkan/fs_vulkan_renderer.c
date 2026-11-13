@@ -149,7 +149,6 @@ struct FSVulkanRenderer {
 
     /* ---- MediaCodec 零拷贝通路（VK_ANDROID_external_memory_android_hardware_buffer）---- */
     int instance_11;                        /* instance 是否为 Vulkan 1.1 */
-    int swapchain_colorspace;               /* instance 启用了 VK_EXT_swapchain_colorspace，HDR 色彩空间才可见 */
     int has_ahb;                            /* physical-device AHB extension availability */
     int mc_supported;                       /* 设备是否支持硬解零拷贝 */
     SDL_AndroidImageReader *mc_reader;      /* 硬解输出目标的硬件 buffer 队列 */
@@ -335,43 +334,21 @@ static VkResult create_instance(FSVulkanRenderer *r)
         .apiVersion = VK_API_VERSION_1_1,
     };
 
-    /* VK_EXT_swapchain_colorspace 是拿到 HDR10(ST2084) 色彩空间的前提：
-       未启用时 vkGetPhysicalDeviceSurfaceFormatsKHR 只报 SRGB_NONLINEAR，
-       HDR 交换链永远探测不到，HDR 内容只能被迫色调映射成 SDR。 */
-    const char *extensions[3] = {
+    const char *extensions[] = {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
     };
-    uint32_t ext_count = 2;
-
-    uint32_t avail_count = 0;
-    VkExtensionProperties *avail = NULL;
-    if (vkEnumerateInstanceExtensionProperties(NULL, &avail_count, NULL) == VK_SUCCESS &&
-        avail_count) {
-        avail = (VkExtensionProperties *) calloc(avail_count, sizeof(*avail));
-        if (avail &&
-            vkEnumerateInstanceExtensionProperties(NULL, &avail_count, avail) == VK_SUCCESS) {
-            for (uint32_t i = 0; i < avail_count; i++) {
-                if (!strcmp(avail[i].extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
-                    extensions[ext_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
-                    break;
-                }
-            }
-        }
-    }
-    free(avail);
 
     VkInstanceCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app,
-        .enabledExtensionCount = ext_count,
+        .enabledExtensionCount = 2,
         .ppEnabledExtensionNames = extensions,
     };
 
     VkResult res = vkCreateInstance(&ci, NULL, &r->instance);
     if (res == VK_SUCCESS) {
         r->instance_11 = 1;
-        r->swapchain_colorspace = ext_count > 2;
         return res;
     }
 
@@ -381,7 +358,6 @@ static VkResult create_instance(FSVulkanRenderer *r)
     res = vkCreateInstance(&ci, NULL, &r->instance);
     if (res != VK_SUCCESS)
         return res;
-    r->swapchain_colorspace = ext_count > 2;
     ALOGW("FSVulkanRenderer: Vulkan 1.1 instance unavailable, using 1.0\n");
     return res;
 }
@@ -588,25 +564,11 @@ static VkResult create_surface_swapchain(FSVulkanRenderer *r)
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(r->physical_device, r->surface, &caps);
 
-    /* 启用 VK_EXT_swapchain_colorspace 后驱动会列出每个格式与所有色彩空间的组合，
-       数量远超固定的 16 项；截断会把 HDR10 组合挤掉，所以按实际数量分配。 */
     uint32_t fmt_count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical_device, r->surface, &fmt_count, NULL);
-    VkSurfaceFormatKHR *formats = NULL;
-    if (fmt_count) {
-        formats = (VkSurfaceFormatKHR *) calloc(fmt_count, sizeof(*formats));
-        if (!formats)
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical_device, r->surface,
-                                                 &fmt_count, formats) != VK_SUCCESS) {
-            free(formats);
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-    }
-    if (fmt_count == 0) {
-        free(formats);
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    VkSurfaceFormatKHR formats[16];
+    if (fmt_count > 16) fmt_count = 16;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical_device, r->surface, &fmt_count, formats);
 
     /* HDR 内容希望直显：优先 10bit 交换链 + HDR10(ST2084) 色彩空间，
        合成器据此把图层标成 HDR，显示器才会切到 HDR 模式。surface 不支持时
@@ -651,11 +613,8 @@ static VkResult create_surface_swapchain(FSVulkanRenderer *r)
     r->swapchain_format = chosen.format;
     r->swapchain_color_space = chosen.colorSpace;
     r->display_hdr_support = hdr_swapchain;
-    ALOGI("FSVulkanRenderer: swapchain format=0x%x colorSpace=0x%x hdr=%d "
-          "want_hdr=%d colorspace_ext=%d surfaces=%u\n",
-          (unsigned)chosen.format, (unsigned)chosen.colorSpace, hdr_swapchain,
-          r->want_hdr, r->swapchain_colorspace, (unsigned)fmt_count);
-    free(formats);
+    ALOGI("FSVulkanRenderer: swapchain format=0x%x colorSpace=0x%x hdr=%d\n",
+          (unsigned)chosen.format, (unsigned)chosen.colorSpace, hdr_swapchain);
 
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
