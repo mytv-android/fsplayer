@@ -170,6 +170,7 @@ struct FSVulkanRenderer {
     int            mc_w;
     int            mc_h;
     uint64_t       mc_external_format;
+    uint64_t       mc_logged_format;   /* 已打印过诊断的外部格式，避免每帧刷屏 */
 
     /* ---- 字幕叠加层（SDL_GPU 产出的纹理，由 vout 每帧塞进来）---- */
     FSVulkanContext       ctx;                /* 暴露给 SDL_GPU 层的设备上下文 */
@@ -3155,6 +3156,21 @@ static int display_mc_frame(FSVulkanRenderer *r, const AVFrame *frame)
             SDL_AndroidImageReader_releaseImage(r->mc_reader);
             return -1;
         }
+    }
+
+    /* HDR 硬解花屏定位用：把驱动给的格式、YCbCr 模型/范围、色度采样位置和解码帧的
+       色彩元数据打在一起。位数与色度位置不一致时（例如驱动按 8bit 布局输出 10bit
+       buffer），这里能直接看出来。只在格式或 HDR 状态变化时打一次，不刷屏。 */
+    if (r->hdr_content && r->mc_logged_format != fmt_props.externalFormat) {
+        r->mc_logged_format = fmt_props.externalFormat;
+        ALOGI("FSVulkanRenderer: mc frame format=0x%x externalFormat=0x%llx "
+              "model=%d range=%d xoff=%d yoff=%d frame=%dx%d pixfmt=%d "
+              "colorspace=%d trc=%d primaries=%d\n",
+              (unsigned)fmt_props.format, (unsigned long long) fmt_props.externalFormat,
+              (int) fmt_props.suggestedYcbcrModel, (int) fmt_props.suggestedYcbcrRange,
+              (int) fmt_props.suggestedXChromaOffset, (int) fmt_props.suggestedYChromaOffset,
+              frame->width, frame->height, (int) frame->format,
+              (int) frame->colorspace, (int) frame->color_trc, (int) frame->color_primaries);
     }
 
     if (import_hardware_buffer(r, (AHardwareBuffer *) ahb, &props, w, h) != 0) {

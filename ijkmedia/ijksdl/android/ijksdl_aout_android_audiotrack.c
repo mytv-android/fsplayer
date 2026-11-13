@@ -125,9 +125,21 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
             opaque->need_flush = 0;
             SDL_Android_AudioTrack_flush(env, atrack);
         } else {
-            int written = SDL_Android_AudioTrack_write(env, atrack, buffer, copy_size);
-            if (written != copy_size) {
-                ALOGW("AudioTrack: not all data copied %d/%d", (int)written, (int)copy_size);
+            /* AudioTrack.write 可能只写入一部分（缓冲将满、flush 打断等）。以前剩下的
+               直接丢，音频实际缺数据、日志还每帧刷一条。这里把没写完的部分补上：
+               SDL_Android_AudioTrack_write 每次都从 byte_buffer 的 0 开始拷，
+               所以循环里要把剩余数据的起点作为新的 buffer 传进去。 */
+            int offset = 0;
+            while (offset < copy_size) {
+                int written = SDL_Android_AudioTrack_write(env, atrack,
+                                                           buffer + offset,
+                                                           copy_size - offset);
+                if (written <= 0)
+                    break;
+                offset += written;
+            }
+            if (offset != copy_size) {
+                ALOGW("AudioTrack: dropped %d/%d bytes", copy_size - offset, copy_size);
             }
         }
 
