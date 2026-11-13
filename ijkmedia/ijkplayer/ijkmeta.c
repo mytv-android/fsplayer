@@ -254,10 +254,33 @@ static const char *ff_get_profile_name_fallback(enum AVCodecID codec_id, int pro
     return NULL;
 }
 
+/* 清掉上一层流信息，保留 meta 本身：同一个播放器实例换源（stop -> setDataSource）
+ * 会重新调用 ijkmeta_set_avformat_context_l，旧源的 stream/chapter 子节点若不清掉，
+ * 会和新子节点叠加，getMediaMeta 依次遍历后上层看到的就是旧源的轨道列表。 */
+void ijkmeta_clear_streams_l(IjkMediaMeta *meta)
+{
+    if (!meta)
+        return;
+
+    if (meta->children) {
+        for (size_t i = 0; i < meta->children_count; ++i) {
+            IjkMediaMeta *child = meta->children[i];
+            if (child)
+                ijkmeta_destroy(child);
+        }
+        free(meta->children);
+        meta->children = NULL;
+    }
+    meta->children_count = 0;
+    meta->children_capacity = 0;
+}
+
 void ijkmeta_set_avformat_context_l(IjkMediaMeta *meta, AVFormatContext *ic)
 {
     if (!meta || !ic)
         return;
+
+    ijkmeta_clear_streams_l(meta);
 
     if (ic->iformat && ic->iformat->name)
         ijkmeta_set_string_l(meta, FSM_KEY_FORMAT, ic->iformat->name);

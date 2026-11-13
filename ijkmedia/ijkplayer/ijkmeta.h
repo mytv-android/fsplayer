@@ -114,6 +114,8 @@ void ijkmeta_lock(IjkMediaMeta *meta);
 void ijkmeta_unlock(IjkMediaMeta *meta);
 
 void ijkmeta_append_child_l(IjkMediaMeta *meta, IjkMediaMeta *child);
+/* 清空 stream/chapter 子节点，保留 meta 自身的字典；换源时复用同一实例前调用。 */
+void ijkmeta_clear_streams_l(IjkMediaMeta *meta);
 void ijkmeta_set_int64_l(IjkMediaMeta *meta, const char *name, int64_t value);
 void ijkmeta_set_string_l(IjkMediaMeta *meta, const char *name, const char *value);
 int ijkmeta_update_icy_from_avformat_context_l(IjkMediaMeta *meta, struct AVFormatContext *ic);

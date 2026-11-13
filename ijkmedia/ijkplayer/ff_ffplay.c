@@ -4380,8 +4380,15 @@ retry_android_software:
                 avctx->codec_id == AV_CODEC_ID_PCM_S16BE_PLANAR ||
                 avctx->codec_id == AV_CODEC_ID_ADPCM_G722 ||
                 avctx->codec_id == AV_CODEC_ID_ADPCM_G726;
+            /* TS 里的 MP2 由 mpegts 先标成 MP3、probe 后改成 MP2：解析器换了 codec_id 之后
+               要多确认一帧才回填参数，探测预算不够就会带着 0 的采样率/声道数走到这里，
+               audio_open 直接失败、整条音频不出声。给一个可用默认值，第一帧解码后
+               swr 会按真实参数重配。 */
+            int is_mpeg_audio = avctx->codec_id == AV_CODEC_ID_MP2 ||
+                avctx->codec_id == AV_CODEC_ID_MP3 ||
+                avctx->codec_id == AV_CODEC_ID_MP1;
             
-            if (is_inband_param_codec) {
+            if (is_inband_param_codec || is_mpeg_audio) {
                 if (avctx->ch_layout.nb_channels == 0) {
                     av_log(NULL, AV_LOG_WARNING,
                         "[Audio] codec '%s' reports 0 channels after avcodec_open2,"
@@ -4926,7 +4933,15 @@ static int read_thread(void *arg)
                                                 codec_id == AV_CODEC_ID_PCM_S16BE_PLANAR ||
                                                 codec_id == AV_CODEC_ID_ADPCM_G722 ||
                                                 codec_id == AV_CODEC_ID_ADPCM_G726;
-                    if (avcodec_find_decoder(codec_id) != NULL && is_inband_param_codec) {
+                    /* MPEG-1/2 audio（尤其 TS 里 stream_type=0x04 的 MP2）：mpegts 先把它
+                       标成 MP3，probe 后 codec_id 改成 MP2，解析器要为新的 codec_id 多确认
+                       一帧才回填 sample_rate/channels。探测预算不够时参数留 0，
+                       av_find_best_stream 会把这条唯一的音轨跳过，播放就彻底没声。 */
+                    int is_mpeg_audio = codec_id == AV_CODEC_ID_MP2 ||
+                                        codec_id == AV_CODEC_ID_MP3 ||
+                                        codec_id == AV_CODEC_ID_MP1;
+                    if (avcodec_find_decoder(codec_id) != NULL &&
+                        (is_inband_param_codec || is_mpeg_audio)) {
                         av_log(NULL, AV_LOG_WARNING,
                             "[Audio] av_find_best_stream returned -1 (incomplete codec params),"
                             " fallback to stream %d codec=%s channels=%d sample_rate=%d\n",
