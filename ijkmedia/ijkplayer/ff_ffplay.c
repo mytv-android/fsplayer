@@ -5112,17 +5112,34 @@ static int read_thread(void *arg)
      *  1) 边出帧边探测时音频参数还没就绪；
      *  2) 显式打开 video-first：换台只要首帧画面，音频那条 stream_component_open()
      *     要建 AudioTrack、打开音频解码器，排在视频前面时整段都算进换台时间。
-     * 都会落进 probe_streaming_pending_audio，由读线程在音频参数就绪（或首帧上屏）
-     * 后调用 stream_component_open() 补开。 */
+     * 都会落进 probe_streaming_pending_audio，由读线程在首帧上屏后
+     * 调用 stream_component_open() 补开。 */
+    /* video-first 时即便参数还没探全也把音频记下来：av_find_best_stream 会因为
+     * 0 channels 跳过整条音轨，那样补开逻辑根本没有机会跑，等于永久没声。
+     * 只在开了 video-first 时放宽，不影响未开启时的既有行为。 */
+    if (ffp->video_first && st_index[AVMEDIA_TYPE_AUDIO] < 0 && !ffp->audio_disable) {
+        for (int i = 0; i < (int)ic->nb_streams; i++) {
+            const AVCodecParameters *par = ic->streams[i]->codecpar;
+            if (par->codec_type == AVMEDIA_TYPE_AUDIO && avcodec_find_decoder(par->codec_id)) {
+                st_index[AVMEDIA_TYPE_AUDIO] = i;
+                av_log(ffp, AV_LOG_INFO,
+                       "video-first: audio stream %d has incomplete params (%d ch, %d Hz), defer it\n",
+                       i, par->ch_layout.nb_channels, par->sample_rate);
+                break;
+            }
+        }
+    }
+
+    int audio_params_ready = st_index[AVMEDIA_TYPE_AUDIO] >= 0 &&
+                             probe_track_ready(ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]);
     int audio_deferred = st_index[AVMEDIA_TYPE_AUDIO] >= 0 &&
-                         (ffp->probe_streaming &&
-                          !probe_track_ready(ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]) ||
+                         ((ffp->probe_streaming && !audio_params_ready) ||
                           (ffp->video_first && !ffp->video_disable &&
                            st_index[AVMEDIA_TYPE_VIDEO] >= 0));
     if (audio_deferred) {
         av_log(ffp, AV_LOG_INFO,
-               "open video first: defer audio stream %d until the first frame is up\n",
-               st_index[AVMEDIA_TYPE_AUDIO]);
+               "defer audio stream %d (params_ready=%d video_first=%d) until the first frame is up\n",
+               st_index[AVMEDIA_TYPE_AUDIO], audio_params_ready, ffp->video_first);
         is->probe_streaming_pending_audio = st_index[AVMEDIA_TYPE_AUDIO];
         st_index[AVMEDIA_TYPE_AUDIO] = -1;
         /* 音频晚到的这段时间用视频主时钟，补开时再切回音频主时钟 */
@@ -5617,28 +5634,55 @@ static int read_thread(void *arg)
                     av_packet_unref(pkt);
                 } else {
                     int stream_index = pkt->stream_index;
-                    /* 之前推迟的音频轨补开。参数就绪是必要条件；video-first 时
-                     * 还要等首帧真的上屏，否则音频解码器和 AudioTrack 又会跟
-                     * 首帧抢 CPU。首帧迟迟不出时也不能一直不出声：等够
-                     * VIDEO_FIRST_AUDIO_MAX_WAIT_MS 就照常打开。 */
-                    if (is->probe_streaming_pending_audio >= 0
-                        && stream_index == is->probe_streaming_pending_audio
-                        && probe_track_ready(ic->streams[stream_index])
-                        && (!ffp->video_first || ffp->first_video_frame_rendered
-                            || av_gettime_relative() - is->read_start_at >
-                               VIDEO_FIRST_AUDIO_MAX_WAIT_MS * 1000)) {
+                    /* 之前推迟的音频轨补开：
+                     *  - video-first 时要等首帧上屏，否则音频解码器和 AudioTrack
+                     *    又跟首帧抢 CPU；首帧迟迟不出时等满 MAX_WAIT 也照开。
+                     *  - 触发不看是哪个流的包：直播里下一个音频包可能几百毫秒后才到，
+                     *    也可能被一整段视频包压在后面，等多久全看源。
+                     *  - 失败要退避并且有上限：参数一直不全时反复重开只是每两秒
+                     *    建一次 AudioTrack 和解码器，白烧电。 */
+                    int audio_pending = is->probe_streaming_pending_audio;
+                    int audio_open_now = !ffp->video_first ||
+                        ffp->first_video_frame_rendered ||
+                        av_gettime_relative() - is->read_start_at >
+                            VIDEO_FIRST_AUDIO_MAX_WAIT_MS * 1000;
+                    int audio_retry_ok =
+                        is->probe_streaming_audio_failed < VIDEO_FIRST_AUDIO_MAX_TRIES &&
+                        (is->probe_streaming_audio_failed == 0 ||
+                         av_gettime_relative() - is->probe_streaming_audio_last_try >
+                             VIDEO_FIRST_AUDIO_RETRY_MS * 1000);
+                    int audio_trigger = audio_pending >= 0 && audio_retry_ok &&
+                        (stream_index == audio_pending || ffp->video_first);
+                    if (audio_trigger && audio_open_now) {
                         int pending = is->probe_streaming_pending_audio;
                         is->probe_streaming_pending_audio = -1;
+                        is->probe_streaming_audio_last_try = av_gettime_relative();
                         av_log(ffp, AV_LOG_INFO,
                                "deferred audio: opening stream %d late\n", pending);
-                        if (stream_component_open(ffp, pending) >= 0 &&
-                            ffp->av_sync_type == AV_SYNC_VIDEO_MASTER) {
-                            /* 起播时因为音频没就绪临时切成了视频主时钟，
-                             * 音频补开后必须切回音频主时钟，否则整场音画都靠视频顶着，
-                             * 音频一旦抖动就会持续错位。 */
-                            ffp->av_sync_type = is->av_sync_type = AV_SYNC_AUDIO_MASTER;
-                            av_log(ffp, AV_LOG_INFO,
-                                   "probe streaming: audio restored, av sync back to audio master\n");
+                        if (stream_component_open(ffp, pending) >= 0) {
+                            if (ffp->av_sync_type == AV_SYNC_VIDEO_MASTER) {
+                                /* 起播时因为音频没就绪临时切成了视频主时钟，
+                                 * 音频补开后必须切回音频主时钟，否则整场音画都靠视频顶着，
+                                 * 音频一旦抖动就会持续错位。 */
+                                ffp->av_sync_type = is->av_sync_type = AV_SYNC_AUDIO_MASTER;
+                                av_log(ffp, AV_LOG_INFO,
+                                       "deferred audio: audio restored, av sync back to audio master\n");
+                            }
+                        } else {
+                            /* 参数一直不全会打到这里。保留 pending，等参数补齐再试；
+                             * 按"参数是否变化"节流，否则每个视频包都会重开一次。 */
+                            const AVCodecParameters *par = ic->streams[pending]->codecpar;
+                            is->probe_streaming_pending_audio = pending;
+                            is->probe_streaming_audio_failed++;
+                            if (par->sample_rate != is->probe_streaming_audio_last_rate ||
+                                par->ch_layout.nb_channels != is->probe_streaming_audio_last_ch) {
+                                is->probe_streaming_audio_last_rate = par->sample_rate;
+                                is->probe_streaming_audio_last_ch = par->ch_layout.nb_channels;
+                                av_log(ffp, AV_LOG_WARNING,
+                                       "deferred audio: stream %d not openable yet (%d ch, %d Hz, attempt %d)\n",
+                                       pending, par->ch_layout.nb_channels,
+                                       par->sample_rate, is->probe_streaming_audio_failed);
+                            }
                         }
                     }
                     if (stream_index == is->audio_stream) {

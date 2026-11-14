@@ -92,6 +92,9 @@
 #define MAX_ACCURATE_SEEK_TIMEOUT (5000)
 /* 先开视频时，首帧迟迟不上屏也要在这么久之后把音频开起来，不能一直没声 */
 #define VIDEO_FIRST_AUDIO_MAX_WAIT_MS (1500)
+/* 补开失败后的重试间隔与次数上限：参数不会突变，太多轮等于反复建 AudioTrack */
+#define VIDEO_FIRST_AUDIO_RETRY_MS (2000)
+#define VIDEO_FIRST_AUDIO_MAX_TRIES (3)
 #define DEFAULT_MIN_FRAMES  50000
 #define MIN_MIN_FRAMES      2
 #define MAX_MIN_FRAMES      50000
@@ -311,6 +314,11 @@ typedef struct VideoState {
     int probe_streaming_param_only;
     /* 边出帧边探测 / 先开视频时被推迟打开的音频轨（-1 表示没有） */
     int probe_streaming_pending_audio;
+    /* 补开失败次数与上次看到的参数，用来节流重试日志 */
+    int probe_streaming_audio_failed;
+    int probe_streaming_audio_last_rate;
+    int probe_streaming_audio_last_ch;
+    int64_t probe_streaming_audio_last_try;
     /* 读线程起跑时刻：video-first 推迟音频时用来兜底超时 */
     int64_t read_start_at;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
