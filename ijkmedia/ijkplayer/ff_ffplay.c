@@ -716,6 +716,11 @@ static void stream_component_close(FFPlayer *ffp, int stream_index)
         break;
     case AVMEDIA_TYPE_VIDEO:
         decoder_abort(&is->viddec, &is->pictq);
+        /* 解码线程停了，但画面队列还握着刚解码出来的硬件帧（一帧都没被显示线程
+         * 消费掉的情况很常见）。这些帧每释放一个都要还一次 MediaCodec 输出缓冲，
+         * 不先清空的话解码器关闭时 hw_buffer_count != 0，音视频实例都进不了复用池，
+         * 下次换台又得重建：真机上 create+configure+start 约 100 ms。 */
+        frame_queue_flush_all(&is->pictq);
         decoder_destroy(&is->viddec);
         ffpipenode_free_p(&ffp->node_vdec);
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
@@ -4866,6 +4871,7 @@ static int read_thread(void *arg)
     }
 
     memset(st_index, -1, sizeof(st_index));
+    is->read_start_at = av_gettime_relative();
     is->eof = 0;
 
     pkt = av_packet_alloc();
@@ -5102,18 +5108,38 @@ static int read_thread(void *arg)
 
     is->show_mode = ffp->show_mode;
 
-    /* 边出帧边探测时，音频参数可能还没就绪：先只开视频把第一帧推出去，
-     * 音频等探测补完后由 start_audio_when_ready() 打开。 */
-    int audio_deferred = ffp->probe_streaming && st_index[AVMEDIA_TYPE_AUDIO] >= 0
-                         && !probe_track_ready(ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]);
+    /* 两种情况下先只开视频、把音频推迟到后面再补开：
+     *  1) 边出帧边探测时音频参数还没就绪；
+     *  2) 显式打开 video-first：换台只要首帧画面，音频那条 stream_component_open()
+     *     要建 AudioTrack、打开音频解码器，排在视频前面时整段都算进换台时间。
+     * 都会落进 probe_streaming_pending_audio，由读线程在音频参数就绪（或首帧上屏）
+     * 后调用 stream_component_open() 补开。 */
+    int audio_deferred = st_index[AVMEDIA_TYPE_AUDIO] >= 0 &&
+                         (ffp->probe_streaming &&
+                          !probe_track_ready(ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]) ||
+                          (ffp->video_first && !ffp->video_disable &&
+                           st_index[AVMEDIA_TYPE_VIDEO] >= 0));
     if (audio_deferred) {
         av_log(ffp, AV_LOG_INFO,
-               "probe streaming: audio params not ready yet, start video-only\n");
+               "open video first: defer audio stream %d until the first frame is up\n",
+               st_index[AVMEDIA_TYPE_AUDIO]);
         is->probe_streaming_pending_audio = st_index[AVMEDIA_TYPE_AUDIO];
         st_index[AVMEDIA_TYPE_AUDIO] = -1;
+        /* 音频晚到的这段时间用视频主时钟，补开时再切回音频主时钟 */
+        ffp->av_sync_type = AV_SYNC_VIDEO_MASTER;
+        is->av_sync_type  = ffp->av_sync_type;
     }
 
-    /* open the streams */
+    /* open the streams
+     *
+     * 先开视频：换台要的是首帧画面，而 stream_component_open() 是同步的，
+     * 音频那条要建 AudioTrack、打开音频解码器，真机上几十到上百毫秒。
+     * 原来排在视频前面，视频解码线程要等它跑完才开始收包，这段全算进换台时间。 */
+    int video_opened = 0;
+    if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
+        video_opened = stream_component_open(ffp, st_index[AVMEDIA_TYPE_VIDEO]) >= 0;
+    }
+
     ret = -1;
     if (st_index[AVMEDIA_TYPE_AUDIO] >= 0) {
         ret = stream_component_open(ffp, st_index[AVMEDIA_TYPE_AUDIO]);
@@ -5127,13 +5153,9 @@ static int read_thread(void *arg)
         is->av_sync_type  = ffp->av_sync_type;
     }
 
-    ret = -1;
-    if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
-        ret = stream_component_open(ffp, st_index[AVMEDIA_TYPE_VIDEO]);
-    }
     if (is->show_mode == SHOW_MODE_NONE)
-        is->show_mode = ret >= 0 ? SHOW_MODE_VIDEO : SHOW_MODE_RDFT;
-    
+        is->show_mode = video_opened ? SHOW_MODE_VIDEO : SHOW_MODE_RDFT;
+
     //tell subtitle stream is ready.
     if (is->video_st) {
         AVCodecParameters *codecpar = is->video_st->codecpar;
@@ -5595,15 +5617,20 @@ static int read_thread(void *arg)
                     av_packet_unref(pkt);
                 } else {
                     int stream_index = pkt->stream_index;
-                    /* 之前推迟的音频轨参数补齐了就立刻补开；否则这条音轨的包会被丢弃 */
+                    /* 之前推迟的音频轨补开。参数就绪是必要条件；video-first 时
+                     * 还要等首帧真的上屏，否则音频解码器和 AudioTrack 又会跟
+                     * 首帧抢 CPU。首帧迟迟不出时也不能一直不出声：等够
+                     * VIDEO_FIRST_AUDIO_MAX_WAIT_MS 就照常打开。 */
                     if (is->probe_streaming_pending_audio >= 0
                         && stream_index == is->probe_streaming_pending_audio
-                        && probe_track_ready(ic->streams[stream_index])) {
+                        && probe_track_ready(ic->streams[stream_index])
+                        && (!ffp->video_first || ffp->first_video_frame_rendered
+                            || av_gettime_relative() - is->read_start_at >
+                               VIDEO_FIRST_AUDIO_MAX_WAIT_MS * 1000)) {
                         int pending = is->probe_streaming_pending_audio;
                         is->probe_streaming_pending_audio = -1;
                         av_log(ffp, AV_LOG_INFO,
-                               "probe streaming: audio params ready, opening stream %d late\n",
-                               pending);
+                               "deferred audio: opening stream %d late\n", pending);
                         if (stream_component_open(ffp, pending) >= 0 &&
                             ffp->av_sync_type == AV_SYNC_VIDEO_MASTER) {
                             /* 起播时因为音频没就绪临时切成了视频主时钟，
@@ -6265,6 +6292,14 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
     assert(ffp);
     assert(!ffp->is);
     assert(file_name);
+
+    /* 每次起播都要重新认定"还没出过画面"。
+     * 换台走的是 stop() + prepareAsync()，渲染器和 ffplayer 实例都保留，
+     * 只在 create/destroy 时清这个标志的话，第二次换台起
+     * FFP_MSG_VIDEO_RENDERING_START 就再也不会发，上层永远等不到首帧。
+     * （first_frame_immediate 也依赖它，不清就会失去"首帧直出"。） */
+    ffp->first_video_frame_rendered = 0;
+    ffp->first_audio_frame_rendered = 0;
 
     if (av_stristart(file_name, "rtmp", NULL) ||
         av_stristart(file_name, "rtsp", NULL)) {

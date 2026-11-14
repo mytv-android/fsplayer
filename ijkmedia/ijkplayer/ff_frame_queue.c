@@ -243,6 +243,27 @@ void frame_queue_flush_readable(FrameQueue *f)
     frame_queue_flush_old_serial(f, -1);
 }
 
+/* 连正在显示的那一帧一起释放。只在解码器即将关闭时用：
+ * keep_last 保留的那帧同样占着一个解码器输出缓冲，不还的话解码器进不了复用池。 */
+void frame_queue_flush_all(FrameQueue *f)
+{
+    SDL_LockMutex(f->mutex);
+    while (f->size > 0) {
+        Frame *frame = &f->queue[f->rindex];
+        frame_queue_unref_item(frame);
+        f->duration -= frame->duration;
+        f->size--;
+        if (++f->rindex == f->max_size)
+            f->rindex = 0;
+    }
+    f->rindex = 0;
+    f->windex = 0;
+    f->rindex_shown = 0;
+    f->duration = 0;
+    SDL_CondSignal(f->cond);
+    SDL_UnlockMutex(f->mutex);
+}
+
 int frame_queue_flush_old_serial(FrameQueue *f, int new_serial)
 {
     SDL_LockMutex(f->mutex);

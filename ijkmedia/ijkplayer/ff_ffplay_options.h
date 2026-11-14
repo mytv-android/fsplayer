@@ -106,6 +106,8 @@ static const AVOption ffp_context_options[] = {
         OPTION_OFFSET(probe_early_exit),    OPTION_INT(0, 0, 1) },
     { "probe-streaming",                "start playback as soon as the primary tracks are known, keep probing in background",
         OPTION_OFFSET(probe_streaming),     OPTION_INT(0, 0, 1) },
+    { "video-first",                    "open the video track alone and defer audio until the first frame is on screen",
+        OPTION_OFFSET(video_first),         OPTION_INT(0, 0, 1) },
 
     // extended options in ff_ffplay.c
     { "deinterlace",                    "enable deinterlace,only software decoding effective (0: disabled, 1: bwdif, 2: yadif, 3: field)",

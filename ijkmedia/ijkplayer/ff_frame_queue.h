@@ -48,6 +48,8 @@ void frame_queue_next(FrameQueue *f);
 int64_t frame_queue_last_pos(FrameQueue *f);
 /* clean all readable frame in queue */
 void frame_queue_flush_readable(FrameQueue *f);
+/* clean every frame in queue, including the one currently displayed */
+void frame_queue_flush_all(FrameQueue *f);
 /* clean old serial readable frame in queue */
 int frame_queue_flush_old_serial(FrameQueue *f, int new_serial);
 #endif /* ff_frame_queue_h */

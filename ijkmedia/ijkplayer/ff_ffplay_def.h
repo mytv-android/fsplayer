@@ -90,6 +90,8 @@
 #define DEFAULT_QUEUE_SIZE (5 * 1024 * 1024)
 #define MAX_QUEUE_SIZE     (50 * 1024 * 1024)
 #define MAX_ACCURATE_SEEK_TIMEOUT (5000)
+/* 先开视频时，首帧迟迟不上屏也要在这么久之后把音频开起来，不能一直没声 */
+#define VIDEO_FIRST_AUDIO_MAX_WAIT_MS (1500)
 #define DEFAULT_MIN_FRAMES  50000
 #define MIN_MIN_FRAMES      2
 #define MAX_MIN_FRAMES      50000
@@ -307,8 +309,10 @@ typedef struct VideoState {
     int probe_streaming_requested;
     int probe_streaming_done;
     int probe_streaming_param_only;
-    /* 边出帧边探测时被推迟打开的音频轨（-1 表示没有） */
+    /* 边出帧边探测 / 先开视频时被推迟打开的音频轨（-1 表示没有） */
     int probe_streaming_pending_audio;
+    /* 读线程起跑时刻：video-first 推迟音频时用来兜底超时 */
+    int64_t read_start_at;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
     int force_refresh_pic;//changed sub prefercence or close sub.
     int force_refresh;
@@ -560,6 +564,8 @@ typedef struct FFPlayer {
     int find_stream_info;
     int probe_early_exit;
     int probe_streaming;
+    /* 换台优先出画：先只开视频轨，音频等首帧上屏后再补开 */
+    int video_first;
     unsigned sws_flags;
 
     int64_t audio_callback_time;
@@ -743,6 +749,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->find_stream_info       = 1;
     ffp->probe_early_exit       = 0; // option
     ffp->probe_streaming        = 0; // option
+    ffp->video_first            = 0; // option
 
     ffp->sws_flags              = SWS_FAST_BILINEAR;
 
