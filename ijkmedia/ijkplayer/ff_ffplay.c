@@ -1203,7 +1203,13 @@ retry:
              video and audio pts are NAN,usually video is firstly display,at this time video picture delay is zero, so we wait until audio clock right,because we need use auido sync video.
              check audioq.duration avoid video picture wait audio forever.
              */
-            if (!is->step_on_seeking && !is->step && get_master_sync_type(is) == AV_SYNC_AUDIO_MASTER && !is->audio_accurate_seek_req) {
+            /* 首帧直出：还没有任何画面时就别再等音频时钟了。
+             * 音频到得比视频晚（FCC、音频参数慢）时，原逻辑会一直卡在这里
+             * 直到音频时钟可用，首帧被硬生生拖后几百毫秒。RustMedia 的做法是
+             * 第一个解码输出立刻上屏，这里对齐同样的行为。 */
+            int first_display_immediate = ffp->first_frame_immediate &&
+                                          !ffp->first_video_frame_rendered;
+            if (!first_display_immediate && !is->step_on_seeking && !is->step && get_master_sync_type(is) == AV_SYNC_AUDIO_MASTER && !is->audio_accurate_seek_req) {
                 if (is->audio_stream >= 0 && isnan(get_master_clock(is)) && is->auddec.finished != is->audioq.serial && vp->pts > 0 && is->audioq.duration > 1) {
                     av_usleep(1000);
                     av_log(NULL,AV_LOG_DEBUG,"wait master clock,video pts is:%0.3f,serial:%d\n", vp->pts, vp->frame_serial);
@@ -1243,7 +1249,9 @@ retry:
             time= av_gettime_relative() / 1000000.0;
             if (isnan(is->frame_timer) || time < is->frame_timer)
                 is->frame_timer = time;
-            if (time < is->frame_timer + delay) {
+            /* 首帧不等这一帧的显示间隔：解码出片就直接上屏。
+             * 之后帧照旧按 frame_timer 节拍走。 */
+            if (!first_display_immediate && time < is->frame_timer + delay) {
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
             }
@@ -4607,6 +4615,51 @@ out:
  * MARK 首路流是否已具备打开解码器所需的参数
  * 探测期间参数写在 FFStream.avctx 上（find_stream_info 收尾才回填 codecpar），这里直接看 avctx。
  */
+/**
+ * 参数集是否完整：H.264 要同时有 SPS(7) 和 PPS(8)，HEVC 要 VPS(32)/SPS(33)/PPS(34)。
+ * 只做 Annex-B 起始码扫描，够用来挡住"探测半途被打断"拿到的残片。
+ */
+static int has_sps_and_pps(const uint8_t *extradata, int size, enum AVCodecID codec_id) {
+    int have_sps = 0, have_pps = 0;
+    int i = 0;
+
+    if (!extradata || size <= 0)
+        return 0;
+    if (codec_id == AV_CODEC_ID_AV1 || codec_id == AV_CODEC_ID_VP9)
+        return 1; /* 非 Annex-B，交给解码器自己判断 */
+
+    while (i + 3 < size) {
+        int start = -1, nalu;
+        if (extradata[i] == 0 && extradata[i + 1] == 0 && extradata[i + 2] == 1) {
+            start = i + 3;
+            i = start;
+        } else if (i + 4 < size && extradata[i] == 0 && extradata[i + 1] == 0 &&
+                   extradata[i + 2] == 0 && extradata[i + 3] == 1) {
+            start = i + 4;
+            i = start;
+        } else {
+            i++;
+            continue;
+        }
+        if (start >= size)
+            break;
+        if (codec_id == AV_CODEC_ID_HEVC)
+            nalu = (extradata[start] >> 1) & 0x3f;
+        else
+            nalu = extradata[start] & 0x1f;
+        if (nalu == 7 || nalu == 33)
+            have_sps = 1;
+        else if (nalu == 8 || nalu == 34)
+            have_pps = 1;
+        /* nalu==32 是 HEVC VPS，不参与判定 */
+        i = start + 1;
+    }
+
+    if (codec_id == AV_CODEC_ID_HEVC)
+        return have_sps && have_pps; /* VPS 缺失时部分解码器也能吃，不强制 */
+    return have_sps && have_pps;
+}
+
 static int probe_track_ready(const AVStream *st) {
     const FFStream *sti = cffstream(st);
     const AVCodecParameters *par = st->codecpar;
@@ -4624,8 +4677,14 @@ static int probe_track_ready(const AVStream *st) {
         case AV_CODEC_ID_HEVC:
         case AV_CODEC_ID_AV1:
         case AV_CODEC_ID_VP9:
-            /* MediaCodec 在 configure 时需要 SPS/PPS（extradata） */
-            return avctx->extradata_size > 0;
+            /* MediaCodec 在 configure 时需要 SPS/PPS（extradata）。
+             * 光 extradata_size>0 不够：探测被提前打断时可能只拿到半个参数集，
+             * 硬解 configure 失败后转软解，解出来的包全是 Invalid data，
+             * 一路空转到下一个 IDR 才出画。这里要求 SPS 和 PPS 都在。 */
+            if (avctx->extradata_size <= 0 || !avctx->extradata)
+                return 0;
+            return has_sps_and_pps(avctx->extradata, avctx->extradata_size,
+                                   par->codec_id) ? 1 : 0;
         default:
             return 1;
         }
@@ -4671,13 +4730,44 @@ static int probe_primary_tracks_ready(VideoState *is) {
     return 1;
 }
 
+/**
+ * MARK 只要求「能出第一帧视频」：有视频轨且参数可解码即算就绪，
+ * 音频轨晚到不阻挡出画（出画后音频补上，画面先冻着）。
+ */
+static int probe_video_ready(VideoState *is) {
+    AVFormatContext *ic = is->ic;
+    int video_seen = 0, video_ready = 0;
+    unsigned i;
+
+    if (!ic)
+        return 0;
+
+    for (i = 0; i < ic->nb_streams; i++) {
+        const AVStream *st = ic->streams[i];
+        if (!st || !st->codecpar || st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            continue;
+        video_seen = 1;
+        video_ready |= probe_track_ready(st);
+    }
+    return video_seen && video_ready;
+}
+
 static int decode_interrupt_cb(void *ctx)
 {
     VideoState *is = ctx;
 
     if (is->abort_request)
         return 1;
-    if (is->probe_early_exit_active) {
+    if (is->probe_streaming_active) {
+        /* 边出帧边探测：视频参数够开播就立刻放行，读线程随后在
+         * probe_streaming_param_only 阶段把剩下的探测补完 */
+        if (!is->probe_streaming_requested && probe_video_ready(is)) {
+            is->probe_streaming_requested = 1;
+            av_log(NULL, AV_LOG_INFO,
+                   "probe streaming: video track ready, start playback while probing continues\n");
+            return 1;
+        }
+    } else if (is->probe_early_exit_active) {
         if (probe_primary_tracks_ready(is)) {
             /* 只中断这一次探测：播放阶段的读取不能再被它打断 */
             is->probe_early_exit_active = 0;
@@ -4852,8 +4942,14 @@ static int read_thread(void *arg)
             ret = err;
             goto fail;
         }
-        is->probe_early_exit_active = ffp->probe_early_exit ? 1 : 0;
+        is->probe_early_exit_active =
+            (ffp->probe_early_exit && !ffp->probe_streaming) ? 1 : 0;
         is->probe_early_exit_requested = 0;
+        is->probe_streaming_active = ffp->probe_streaming ? 1 : 0;
+        is->probe_streaming_requested = 0;
+        av_log(ffp, AV_LOG_INFO,
+               "probe mode: streaming=%d early_exit=%d\n",
+               ffp->probe_streaming, ffp->probe_early_exit);
         do {
             if (av_stristart(is->filename, "data:", NULL) && orig_nb_streams > 0) {
                 for (i = 0; i < orig_nb_streams; i++) {
@@ -4869,6 +4965,7 @@ static int read_thread(void *arg)
             err = avformat_find_stream_info(ic, opts);
         } while(0);
         is->probe_early_exit_active = 0;
+        is->probe_streaming_active = 0;
         ffp_notify_msg1(ffp, FFP_MSG_FIND_STREAM_INFO);
 
         for (i = 0; i < orig_nb_streams; i++)
@@ -4877,7 +4974,8 @@ static int read_thread(void *arg)
 
         /* 提前中断时后面的流可能没凑齐，find_stream_info 会返回负值，但音视频参数已经够开播；
          * 收尾阶段仍会把 avctx 参数回填 codecpar，不能当成流信息失败 */
-        if (err < 0 && is->probe_early_exit_requested && !is->abort_request) {
+        if (err < 0 && (is->probe_early_exit_requested || is->probe_streaming_requested)
+            && !is->abort_request) {
             av_log(ffp, AV_LOG_INFO,
                    "probe early exit: primary audio/video tracks are ready\n");
             err = 0;
@@ -5004,12 +5102,23 @@ static int read_thread(void *arg)
 
     is->show_mode = ffp->show_mode;
 
+    /* 边出帧边探测时，音频参数可能还没就绪：先只开视频把第一帧推出去，
+     * 音频等探测补完后由 start_audio_when_ready() 打开。 */
+    int audio_deferred = ffp->probe_streaming && st_index[AVMEDIA_TYPE_AUDIO] >= 0
+                         && !probe_track_ready(ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]);
+    if (audio_deferred) {
+        av_log(ffp, AV_LOG_INFO,
+               "probe streaming: audio params not ready yet, start video-only\n");
+        is->probe_streaming_pending_audio = st_index[AVMEDIA_TYPE_AUDIO];
+        st_index[AVMEDIA_TYPE_AUDIO] = -1;
+    }
+
     /* open the streams */
     ret = -1;
     if (st_index[AVMEDIA_TYPE_AUDIO] >= 0) {
         ret = stream_component_open(ffp, st_index[AVMEDIA_TYPE_AUDIO]);
     }
-    
+
     //when open audio stream failed or no audio stream use video as av sync master.
     if (ret || st_index[AVMEDIA_TYPE_AUDIO] == -1) {
         av_log(ffp, AV_LOG_WARNING,
@@ -5486,6 +5595,25 @@ static int read_thread(void *arg)
                     av_packet_unref(pkt);
                 } else {
                     int stream_index = pkt->stream_index;
+                    /* 之前推迟的音频轨参数补齐了就立刻补开；否则这条音轨的包会被丢弃 */
+                    if (is->probe_streaming_pending_audio >= 0
+                        && stream_index == is->probe_streaming_pending_audio
+                        && probe_track_ready(ic->streams[stream_index])) {
+                        int pending = is->probe_streaming_pending_audio;
+                        is->probe_streaming_pending_audio = -1;
+                        av_log(ffp, AV_LOG_INFO,
+                               "probe streaming: audio params ready, opening stream %d late\n",
+                               pending);
+                        if (stream_component_open(ffp, pending) >= 0 &&
+                            ffp->av_sync_type == AV_SYNC_VIDEO_MASTER) {
+                            /* 起播时因为音频没就绪临时切成了视频主时钟，
+                             * 音频补开后必须切回音频主时钟，否则整场音画都靠视频顶着，
+                             * 音频一旦抖动就会持续错位。 */
+                            ffp->av_sync_type = is->av_sync_type = AV_SYNC_AUDIO_MASTER;
+                            av_log(ffp, AV_LOG_INFO,
+                                   "probe streaming: audio restored, av sync back to audio master\n");
+                        }
+                    }
                     if (stream_index == is->audio_stream) {
                         asr_packet_tap_put(ffp, pkt);
                         packet_queue_put(&is->audioq, pkt);
@@ -5588,6 +5716,7 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
         return NULL;
     is->video_stream = -1;
     is->audio_stream = -1;
+    is->probe_streaming_pending_audio = -1;
     is->filename = av_strdup(filename);
     if (!is->filename)
         goto fail;

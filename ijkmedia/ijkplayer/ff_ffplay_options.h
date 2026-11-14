@@ -104,6 +104,8 @@ static const AVOption ffp_context_options[] = {
 
     { "probe-early-exit",               "stop stream probing once the primary audio/video tracks are decodable",
         OPTION_OFFSET(probe_early_exit),    OPTION_INT(0, 0, 1) },
+    { "probe-streaming",                "start playback as soon as the primary tracks are known, keep probing in background",
+        OPTION_OFFSET(probe_streaming),     OPTION_INT(0, 0, 1) },
 
     // extended options in ff_ffplay.c
     { "deinterlace",                    "enable deinterlace,only software decoding effective (0: disabled, 1: bwdif, 2: yadif, 3: field)",
@@ -162,6 +164,8 @@ static const AVOption ffp_context_options[] = {
         OPTION_OFFSET(packet_buffering),    OPTION_INT(1, 0, 1) },
     { "sync-av-start",                      "synchronise a/v start time",
         OPTION_OFFSET(sync_av_start),       OPTION_INT(1, 0, 1) },
+    { "first-frame-immediate",              "display the first decoded video frame without waiting for the audio clock",
+        OPTION_OFFSET(first_frame_immediate), OPTION_INT(1, 0, 1) },
     { "iformat",                            "force format",
         OPTION_OFFSET(iformat_name),        OPTION_STR(NULL) },
     { "no-time-adjust",                     "return player's real time from the media stream instead of the adjusted time",

@@ -301,6 +301,14 @@ typedef struct VideoState {
     int abort_request;
     int probe_early_exit_active;
     int probe_early_exit_requested;
+    /* 边出帧边探测：探测中一旦首路音视频参数可用，就先放行播放，
+     * 读线程在后台继续把探测做完。 */
+    int probe_streaming_active;
+    int probe_streaming_requested;
+    int probe_streaming_done;
+    int probe_streaming_param_only;
+    /* 边出帧边探测时被推迟打开的音频轨（-1 表示没有） */
+    int probe_streaming_pending_audio;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
     int force_refresh_pic;//changed sub prefercence or close sub.
     int force_refresh;
@@ -551,6 +559,7 @@ typedef struct FFPlayer {
     int max_audio_output_channels;
     int find_stream_info;
     int probe_early_exit;
+    int probe_streaming;
     unsigned sws_flags;
 
     int64_t audio_callback_time;
@@ -575,6 +584,7 @@ typedef struct FFPlayer {
     int first_video_frame_rendered;
     int first_audio_frame_rendered;
     int sync_av_start;
+    int first_frame_immediate;
 
     MessageQueue msg_queue;
 
@@ -732,6 +742,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->autorotate             = 1;
     ffp->find_stream_info       = 1;
     ffp->probe_early_exit       = 0; // option
+    ffp->probe_streaming        = 0; // option
 
     ffp->sws_flags              = SWS_FAST_BILINEAR;
 
@@ -754,6 +765,7 @@ inline static void ffp_reset_internal(FFPlayer *ffp)
     ffp->start_on_prepared      = 1;
     ffp->first_video_frame_rendered = 0;
     ffp->sync_av_start          = 1;
+    ffp->first_frame_immediate  = 1;
     ffp->enable_accurate_seek   = 0;
     ffp->accurate_seek_timeout  = MAX_ACCURATE_SEEK_TIMEOUT;
 
