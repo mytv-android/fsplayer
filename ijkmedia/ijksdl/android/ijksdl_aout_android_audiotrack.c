@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <assert.h>
+#include <pthread.h>
 #include <jni.h>
 #include "../ijksdl_inc_internal.h"
 #include "../ijksdl_thread.h"
@@ -68,6 +69,46 @@ typedef struct SDL_Aout_Opaque {
     volatile float speed;
     volatile bool speed_changed;
 } SDL_Aout_Opaque;
+
+static void *audiotrack_release_thread(void *arg)
+{
+    SDL_Android_AudioTrack *atrack = arg;
+    JNIEnv *env = NULL;
+
+    if (JNI_OK != SDL_JNI_SetupThreadEnv(&env)) {
+        ALOGE("aout: release thread could not attach JNI, AudioTrack leaked\n");
+        return NULL;
+    }
+    SDL_Android_AudioTrack_free(env, atrack);
+    SDL_JNI_DetachThreadEnv();
+    return NULL;
+}
+
+/*
+ * 音频线程退出时释放 AudioTrack。
+ *
+ * AudioTrack.release() 要和 AudioFlinger 跨进程收尾，部分设备上几十毫秒；它跑在音频线程的
+ * 退出路径上，而 stop() 要 join 音频线程，换台时这段全算进下一台的等待。先 pause + flush
+ * 让声音立刻停（stop() 在流模式下会把缓冲放完才停），release 交给一个分离的后台线程
+ * （Media3 的 DefaultAudioSink 同样把 release 放到后台线程）。线程起不来就退回同步释放。
+ */
+static void audiotrack_free_async(JNIEnv *env, SDL_Android_AudioTrack *atrack)
+{
+    pthread_attr_t attr;
+    pthread_t tid;
+    int started = 0;
+
+    SDL_Android_AudioTrack_pause(env, atrack);
+    SDL_Android_AudioTrack_flush(env, atrack);
+
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        started = pthread_create(&tid, &attr, audiotrack_release_thread, atrack) == 0;
+        pthread_attr_destroy(&attr);
+    }
+    if (!started)
+        SDL_Android_AudioTrack_free(env, atrack);
+}
 
 static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
 {
@@ -146,7 +187,7 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
         // TODO: 1 if callback return -1 or 0
     }
 
-    SDL_Android_AudioTrack_free(env, atrack);
+    audiotrack_free_async(env, atrack);
     return 0;
 }
 
