@@ -834,6 +834,8 @@ static void stream_close(FFPlayer *ffp)
     VideoState *is = ffp->is;
     /* 收尾分段计时：换台时 stop() 是同步的，这段全算在下一台的等待里 */
     int64_t t_begin = av_gettime_relative(), t_read, t_refresh, t_audio, t_video, t_input;
+    /* ffp_stop_l 已经置过 abort_request，这里取到的就是读线程收到停止时在做的事 */
+    int read_phase = is->trace_read_phase;
     /* XXX: use a special url_shutdown call to abort parse cleanly */
     is->abort_request = 1;
     packet_queue_abort(&is->videoq);
@@ -888,8 +890,10 @@ static void stream_close(FFPlayer *ffp)
     ffp->is = NULL;
     ffp->trace_last_stop_us = av_gettime_relative() - t_begin;
     av_log(NULL, AV_LOG_INFO,
-           "stream_close did close, ms: read_thread=%d refresh_thread=%d audio=%d video=%d input=%d total=%d\n",
-           (int)((t_read - t_begin) / 1000), (int)((t_refresh - t_read) / 1000),
+           "stream_close did close, ms: read_thread=%d(%s) refresh_thread=%d audio=%d video=%d input=%d total=%d\n",
+           (int)((t_read - t_begin) / 1000),
+           read_phase == 1 ? "read" : read_phase == 2 ? "audio_open" : "other",
+           (int)((t_refresh - t_read) / 1000),
            (int)((t_audio - t_refresh) / 1000), (int)((t_video - t_audio) / 1000),
            (int)((t_input - t_video) / 1000), (int)(ffp->trace_last_stop_us / 1000));
 }
@@ -5624,7 +5628,9 @@ static int read_thread(void *arg)
         }
         
         pkt->flags = 0;
+        is->trace_read_phase = 1;
         ret = av_read_frame(ic, pkt);
+        is->trace_read_phase = 0;
         if (ret < 0) {
             int pb_eof = 0;
             int pb_error = 0;
@@ -5847,11 +5853,18 @@ static int read_thread(void *arg)
                     }
                     if (audio_trigger && audio_open_now) {
                         int pending = is->probe_streaming_pending_audio;
+                        int audio_opened;
                         is->probe_streaming_pending_audio = -1;
                         is->probe_streaming_audio_last_try = av_gettime_relative();
                         av_log(ffp, AV_LOG_INFO,
                                "deferred audio: opening stream %d late\n", pending);
-                        if (stream_component_open(ffp, pending) >= 0) {
+                        is->trace_read_phase = 2;
+                        audio_opened = stream_component_open(ffp, pending) >= 0;
+                        is->trace_read_phase = 0;
+                        av_log(ffp, AV_LOG_INFO, "deferred audio: stream %d open %s in %d ms\n",
+                               pending, audio_opened ? "done" : "failed",
+                               (int)((av_gettime_relative() - is->probe_streaming_audio_last_try) / 1000));
+                        if (audio_opened) {
                             if (ffp->av_sync_type == AV_SYNC_VIDEO_MASTER) {
                                 /* 起播时因为音频没就绪临时切成了视频主时钟，
                                  * 音频补开后必须切回音频主时钟，否则整场音画都靠视频顶着，

@@ -337,6 +337,9 @@ typedef struct VideoState {
     int64_t trace_first_vframe_at;
     int64_t trace_first_vqueued_at;
     int64_t trace_first_display_at;
+    /* 读线程当前在做什么（stop 时打进收尾日志，看 join 读线程慢在哪）：
+     * 0 其它，1 av_read_frame（多半在等网络），2 补开推迟的音轨 */
+    volatile int trace_read_phase;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
     int force_refresh_pic;//changed sub prefercence or close sub.
     int force_refresh;
