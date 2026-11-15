@@ -57,6 +57,7 @@ typedef struct SDL_Aout_Opaque {
     volatile bool need_flush;
     volatile bool pause_on;
     volatile bool abort_request;
+    bool loop_exited;           /* 音频线程已退出写循环、不再碰 AudioTrack 的 write；受 wakeup_mutex 保护 */
 
     volatile bool need_set_volume;
     volatile float left_volume;
@@ -182,7 +183,7 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
                     break;
                 offset += written;
             }
-            if (offset != copy_size) {
+            if (offset != copy_size && !opaque->abort_request) {
                 ALOGW("AudioTrack: dropped %d/%d bytes", copy_size - offset, copy_size);
             }
         }
@@ -190,6 +191,12 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
         // TODO: 1 if callback return -1 or 0
     }
 
+    /* aout_close_audio 持锁调 pause/stop 打断 write：置位之后它就不会再碰 AudioTrack，
+       这里才能释放 */
+    SDL_LockMutex(opaque->wakeup_mutex);
+    opaque->loop_exited = true;
+    SDL_CondBroadcast(opaque->wakeup_cond);
+    SDL_UnlockMutex(opaque->wakeup_mutex);
     audiotrack_free_async(env, atrack);
     return 0;
 }
@@ -202,6 +209,12 @@ static int aout_thread(void *arg)
 
     if (JNI_OK != SDL_JNI_SetupThreadEnv(&env)) {
         ALOGE("aout_thread: SDL_AndroidJni_SetupEnv: failed");
+        /* aout_close_audio 在等 loop_exited，没进写循环也要置位 */
+        SDL_Aout_Opaque *opaque = aout->opaque;
+        SDL_LockMutex(opaque->wakeup_mutex);
+        opaque->loop_exited = true;
+        SDL_CondBroadcast(opaque->wakeup_cond);
+        SDL_UnlockMutex(opaque->wakeup_mutex);
         return -1;
     }
 
@@ -246,6 +259,7 @@ static int aout_open_audio_n(JNIEnv *env, SDL_Aout *aout, const SDL_AudioSpec *d
 
     opaque->pause_on = 1;
     opaque->abort_request = 0;
+    opaque->loop_exited = false;
     opaque->audio_tid = SDL_CreateThreadEx(&opaque->_audio_tid, aout_thread, aout, "ff_aout_android");
     if (!opaque->audio_tid) {
         ALOGE("aout_open_audio_n: failed to create audio thread");
@@ -306,12 +320,36 @@ static void aout_set_volume(SDL_Aout *aout, float left_volume, float right_volum
 static void aout_close_audio(SDL_Aout *aout)
 {
     SDL_Aout_Opaque *opaque = aout->opaque;
+    JNIEnv *env = NULL;
     if (NULL == opaque->audio_tid) {
         return;
     }
     SDL_LockMutex(opaque->wakeup_mutex);
     opaque->abort_request = true;
     SDL_CondSignal(opaque->wakeup_cond);
+    /*
+     * 音频线程多半正卡在阻塞的 AudioTrack.write 里：缓冲满了要等混音器取走数据，真机上
+     * 一等 70~90ms，abort 要等这次 write 返回才看得见，换台全算进下一台。别的线程调 pause
+     * 会打断阻塞的 write（AudioTrack.write 文档写明），暂停后的 write 也不再阻塞。
+     *
+     * 极少数情况下这次打断会被 AudioTrack 内部吞掉：落在 obtainBuffer 已判过 ACTIVE、还没
+     * 开始等待之间，线程会一直卡在暂停的轨道上。所以等它退出写循环时带超时，超时就 stop
+     * 再打断一次（stop 在 PAUSED 状态下也会 interrupt）。
+     * 全程持锁（等待时 cond 会放锁）：音频线程置 loop_exited 也要拿这把锁，置位之后才释放
+     * AudioTrack，pause/stop 期间对象不会被释放。
+     */
+    if (opaque->atrack && JNI_OK == SDL_JNI_SetupThreadEnv(&env))
+        SDL_Android_AudioTrack_pause(env, opaque->atrack);
+    else
+        env = NULL;
+    while (!opaque->loop_exited) {
+        if (SDL_CondWaitTimeout(opaque->wakeup_cond, opaque->wakeup_mutex, 50) == SDL_MUTEX_TIMEDOUT &&
+            !opaque->loop_exited && env) {
+            ALOGW("aout: audio thread still in write 50ms after pause, stop to interrupt again\n");
+            SDL_Android_AudioTrack_stop(env, opaque->atrack);
+            env = NULL; /* 只补一次；之后就照原样等线程自己退出 */
+        }
+    }
     SDL_UnlockMutex(opaque->wakeup_mutex);
 
     SDL_WaitThread(opaque->audio_tid, NULL);
