@@ -6083,7 +6083,14 @@ static int video_refresh_thread(void *arg)
     while (!is->abort_request) {
         if (remaining_time > 0.0)
             av_usleep((int)(int64_t)(remaining_time * 1000000.0));
-        remaining_time = REFRESH_RATE;
+        /* 首帧直出：视频轨开了、还没出过画面时 1ms 看一次画面队列，解好的首帧
+         * 不必再白等最多一个 REFRESH_RATE。只管起播头几秒，流一直不出画也不会空转。 */
+        if (ffp->first_frame_immediate && !ffp->first_video_frame_rendered && is->video_st &&
+            is->read_start_at > 0 &&
+            av_gettime_relative() - is->read_start_at < FIRST_FRAME_FAST_REFRESH_US)
+            remaining_time = FIRST_FRAME_FAST_REFRESH;
+        else
+            remaining_time = REFRESH_RATE;
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh || is->step_on_seeking || is->force_refresh_sub_changed || is->force_refresh_pic))
             video_refresh(ffp, &remaining_time);
     }

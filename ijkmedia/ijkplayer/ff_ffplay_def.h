@@ -97,6 +97,9 @@
 #define VIDEO_FIRST_AUDIO_MAX_TRIES (3)
 /* 首帧直出：硬解首帧出来之前，队列空时最多等这么久就回头问一次解码器有没有输出 */
 #define FIRST_FRAME_POLL_MS (2)
+/* 首帧上屏之前显示线程的轮询间隔（秒）与生效时长（微秒） */
+#define FIRST_FRAME_FAST_REFRESH (0.001)
+#define FIRST_FRAME_FAST_REFRESH_US (5000000)
 #define DEFAULT_MIN_FRAMES  50000
 #define MIN_MIN_FRAMES      2
 #define MAX_MIN_FRAMES      50000
