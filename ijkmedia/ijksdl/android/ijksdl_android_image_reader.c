@@ -341,10 +341,23 @@ int SDL_AndroidImageReader_acquireLatest(SDL_AndroidImageReader *r, void **out_h
     return 0;
 }
 
+/* 只有带换台预热的 FFmpeg 产物才有这个函数，其它 ABI 的旧产物里没有：弱引用，缺了就跳过。 */
+extern void ff_mediacodec_dec_warm_clear(void *native_window) __attribute__((weak));
+
+void SDL_AndroidMediaCodec_ClearWarm(void *native_window)
+{
+    if (ff_mediacodec_dec_warm_clear)
+        ff_mediacodec_dec_warm_clear(native_window);
+}
+
 void SDL_AndroidImageReader_destroy(SDL_AndroidImageReader *r)
 {
     if (!r)
         return;
+
+    /* 预热实例的输出就接在这个读端的 window 上，读端删掉之前先把它删了 */
+    if (r->window)
+        SDL_AndroidMediaCodec_ClearWarm(r->window);
 
     if (r->reader)
         g_mc_lib.AImageReader_setImageListener(r->reader, NULL);

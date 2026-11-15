@@ -22,6 +22,7 @@
 #include <time.h>
 #if defined(__ANDROID__) && !defined(FS_GLES_NO_JNI)
 #include "../ijksdl_android_jni.h"
+#include "../ijksdl_android_image_reader.h"
 #include "libavcodec/mediacodec.h"
 #define FS_GLES_ANDROID_CODEC 1
 #endif
@@ -1437,6 +1438,10 @@ void fs_gles_renderer_destroy(FSGLESRenderer *r)
     fs_gles_renderer_detach_gpu(r);
     LOGI("renderer totals: oes_frames=%lu cpu_uploads=%lu", r->oes_frames, r->cpu_uploads);
     av_frame_free(&r->mc_last);
+#ifdef FS_GLES_ANDROID_CODEC
+    /* 万一有换台预热的硬解实例接在本渲染器的输出 Surface 上，Surface 释放前删掉 */
+    SDL_AndroidMediaCodec_ClearWarm(NULL);
+#endif
     mc_cleanup(r);
     if (r->context != EGL_NO_CONTEXT && r->pbuffer != EGL_NO_SURFACE &&
         eglMakeCurrent(r->display, r->pbuffer, r->pbuffer, r->context)) {

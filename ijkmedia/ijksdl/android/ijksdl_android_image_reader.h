@@ -82,4 +82,10 @@ void SDL_AndroidImageReader_releaseImage(SDL_AndroidImageReader *r);
 
 void SDL_AndroidImageReader_destroy(SDL_AndroidImageReader *r);
 
+/*
+ * 删掉 FFmpeg mediacodec 换台预热时停在 native_window 上的硬解实例（NULL 表示全部）。
+ * 硬解输出目标销毁前调用，否则那个预热实例一直占着一个硬解实例。
+ */
+void SDL_AndroidMediaCodec_ClearWarm(void *native_window);
+
 #endif
