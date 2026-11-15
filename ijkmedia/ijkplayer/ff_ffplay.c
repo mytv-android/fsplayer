@@ -774,16 +774,24 @@ static void stream_component_close(FFPlayer *ffp, int stream_index)
     codecpar = ic->streams[stream_index]->codecpar;
 
     switch (codecpar->codec_type) {
-    case AVMEDIA_TYPE_AUDIO:
+    case AVMEDIA_TYPE_AUDIO: {
+        /* 换台时这一段偶尔要 70~90ms，分段记下来看卡在哪一步 */
+        int64_t t0 = av_gettime_relative(), t1, t2;
         decoder_abort(&is->auddec, &is->sampq);
+        t1 = av_gettime_relative();
         SDL_AoutCloseAudio(ffp->aout);
+        t2 = av_gettime_relative();
 
         decoder_destroy(&is->auddec);
+        av_log(NULL, AV_LOG_INFO, "audio close ms: abort=%d aout=%d destroy=%d\n",
+               (int)((t1 - t0) / 1000), (int)((t2 - t1) / 1000),
+               (int)((av_gettime_relative() - t2) / 1000));
         swr_free(&is->swr_ctx);
         av_freep(&is->audio_buf1);
         is->audio_buf1_size = 0;
         is->audio_buf = NULL;
         break;
+    }
     case AVMEDIA_TYPE_VIDEO:
         decoder_abort(&is->viddec, &is->pictq);
         /* 解码线程停了，但画面队列还握着刚解码出来的硬件帧（一帧都没被显示线程

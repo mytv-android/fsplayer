@@ -31,6 +31,7 @@
 #include "../ijksdl_inc_internal.h"
 #include "../ijksdl_thread.h"
 #include "../ijksdl_aout_internal.h"
+#include "../ijksdl_timer.h"
 #include "ijksdl_android_jni.h"
 #include "android_audiotrack.h"
 
@@ -97,9 +98,11 @@ static void audiotrack_free_async(JNIEnv *env, SDL_Android_AudioTrack *atrack)
     pthread_attr_t attr;
     pthread_t tid;
     int started = 0;
+    Uint64 t0 = SDL_GetTickHR();
 
     SDL_Android_AudioTrack_pause(env, atrack);
     SDL_Android_AudioTrack_flush(env, atrack);
+    ALOGI("aout exit: pause+flush %d ms\n", (int)(SDL_GetTickHR() - t0));
 
     if (pthread_attr_init(&attr) == 0) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
