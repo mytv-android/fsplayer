@@ -4893,6 +4893,77 @@ static double max_buffer_size(FFPlayer *ffp)
     return ffp->dcc.max_buffer_size + fabs(audio_delay) * DEFAULT_QUEUE_SIZE;
 }
 
+#define DEFERRED_AUDIO_MAX_PARAM_FAILS (20)
+
+/*
+ * 推迟打开的音轨，参数是不是已经够 audio_open 用了。
+ *
+ * 探测被提前放行（probe-streaming）时，音频解码器在 find_stream_info 里一帧都没来得及解。
+ * AAC 尤其如此：FFmpeg 认为 ADTS 头里的采样率/声道不可信（HE-AAC 的 SBR/PS），解析器
+ * 不回填，只有真解一帧才知道，于是 codecpar 一直是 0 ch / 0 Hz，补开每次都在 audio_open
+ * 失败，三次之后整场没声。
+ *
+ * 缺参数时就用读线程手里这个音频包临时解一帧，把真实参数写回 codecpar——等价于
+ * find_stream_info 本来会做的 try_decode_frame，只解一包，约 1ms。pkt 为 NULL（手里
+ * 是视频包）时只做判断。解失败不计入补开失败，等下一个音频包再试；连续失败超过上限
+ * 就放行，交给原来的重试/退避去处理。
+ */
+static int deferred_audio_params_ready(FFPlayer *ffp, AVStream *st, const AVPacket *pkt)
+{
+    VideoState *is = ffp->is;
+    AVCodecParameters *par = st->codecpar;
+    const AVCodec *codec;
+    AVCodecContext *avctx = NULL;
+    AVFrame *frame = NULL;
+    int ok = 0;
+
+    if (par->sample_rate > 0 && par->ch_layout.nb_channels > 0)
+        return 1;
+    if (is->probe_streaming_audio_param_fails >= DEFERRED_AUDIO_MAX_PARAM_FAILS)
+        return 1;
+    if (!pkt || pkt->size <= 0)
+        return 0;
+
+    codec = avcodec_find_decoder(par->codec_id);
+    if (!codec) {
+        is->probe_streaming_audio_param_fails = DEFERRED_AUDIO_MAX_PARAM_FAILS;
+        return 1;
+    }
+    avctx = avcodec_alloc_context3(codec);
+    frame = av_frame_alloc();
+    if (!avctx || !frame)
+        goto end;
+    if (avcodec_parameters_to_context(avctx, par) < 0)
+        goto end;
+    avctx->pkt_timebase = st->time_base;
+    if (avcodec_open2(avctx, codec, NULL) < 0)
+        goto end;
+    if (avcodec_send_packet(avctx, pkt) < 0 || avcodec_receive_frame(avctx, frame) < 0)
+        goto end;
+    if (frame->sample_rate <= 0 || frame->ch_layout.nb_channels <= 0)
+        goto end;
+    if (av_channel_layout_copy(&par->ch_layout, &frame->ch_layout) < 0)
+        goto end;
+    par->sample_rate = frame->sample_rate;
+    if (par->format < 0)
+        par->format = frame->format;
+    if (par->frame_size <= 0)
+        par->frame_size = frame->nb_samples;
+    ok = 1;
+    av_log(ffp, AV_LOG_INFO, "deferred audio: params from first packet: %s %d Hz %d ch\n",
+           avcodec_get_name(par->codec_id), par->sample_rate, par->ch_layout.nb_channels);
+end:
+    av_frame_free(&frame);
+    avcodec_free_context(&avctx);
+    if (!ok && ++is->probe_streaming_audio_param_fails >= DEFERRED_AUDIO_MAX_PARAM_FAILS) {
+        av_log(ffp, AV_LOG_WARNING,
+               "deferred audio: could not decode params from %d packets, open it anyway\n",
+               is->probe_streaming_audio_param_fails);
+        return 1;
+    }
+    return ok;
+}
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -5199,6 +5270,10 @@ static int read_thread(void *arg)
                "defer audio stream %d (params_ready=%d video_first=%d) until the first frame is up\n",
                st_index[AVMEDIA_TYPE_AUDIO], audio_params_ready, ffp->video_first);
         is->probe_streaming_pending_audio = st_index[AVMEDIA_TYPE_AUDIO];
+        /* 参数没探全时要靠这条音轨自己的包解一帧补参数（deferred_audio_params_ready），
+         * 不能让解复用器把它的包整条丢掉；补开之前读到的包照旧不入队。 */
+        if (!audio_params_ready)
+            ic->streams[st_index[AVMEDIA_TYPE_AUDIO]]->discard = AVDISCARD_DEFAULT;
         st_index[AVMEDIA_TYPE_AUDIO] = -1;
         /* 音频晚到的这段时间用视频主时钟，补开时再切回音频主时钟 */
         ffp->av_sync_type = AV_SYNC_VIDEO_MASTER;
@@ -5712,6 +5787,12 @@ static int read_thread(void *arg)
                              VIDEO_FIRST_AUDIO_RETRY_MS * 1000);
                     int audio_trigger = audio_pending >= 0 && audio_retry_ok &&
                         (stream_index == audio_pending || ffp->video_first);
+                    if (audio_trigger && audio_open_now &&
+                        !deferred_audio_params_ready(ffp, ic->streams[audio_pending],
+                                                     stream_index == audio_pending ? pkt : NULL)) {
+                        /* 参数还得等这条音轨自己的包来解；这一次不算补开失败 */
+                        audio_trigger = 0;
+                    }
                     if (audio_trigger && audio_open_now) {
                         int pending = is->probe_streaming_pending_audio;
                         is->probe_streaming_pending_audio = -1;

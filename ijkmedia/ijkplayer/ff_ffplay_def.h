@@ -319,6 +319,8 @@ typedef struct VideoState {
     int probe_streaming_audio_last_rate;
     int probe_streaming_audio_last_ch;
     int64_t probe_streaming_audio_last_try;
+    /* 用音频包解一帧取参数失败的次数：超过上限就退回原来的重试/退避 */
+    int probe_streaming_audio_param_fails;
     /* 读线程起跑时刻：video-first 推迟音频时用来兜底超时 */
     int64_t read_start_at;
     /* 起播分段时刻（av_gettime_relative，0 = 还没到）。首帧上屏时打成一行日志，
