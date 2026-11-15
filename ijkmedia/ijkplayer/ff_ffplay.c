@@ -5019,6 +5019,7 @@ static int read_thread(void *arg)
     int pkt_in_play_range = 0;
     SDL_mutex *wait_mutex = SDL_CreateMutex();
     int scan_all_pmts_set = 0;
+    int early_video_params_set = 0;
     int64_t pkt_ts;
     int last_error = 0;
     int64_t prev_io_tick_counter = 0;
@@ -5061,6 +5062,14 @@ static int read_thread(void *arg)
                     AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+    /* early_video_params：TS 里关键帧 PES 开头一带上 SPS/PPS，解复用器就填好视频参数，
+     * 不等整个关键帧（几十到上百 KB）收完。探测随即结束，硬解实例跟关键帧下载并行建。
+     * 只在 probe 早退/流式探测时打开。 */
+    if ((ffp->probe_early_exit || ffp->probe_streaming) &&
+        !av_dict_get(ffp->format_opts, "early_video_params", NULL, AV_DICT_MATCH_CASE)) {
+        av_dict_set(&ffp->format_opts, "early_video_params", "1", 0);
+        early_video_params_set = 1;
+    }
     if (av_stristart(is->filename, "rtmp", NULL) ||
         av_stristart(is->filename, "rtsp", NULL)) {
         // There is total different meaning for 'timeout' option in rtmp
@@ -5090,6 +5099,8 @@ static int read_thread(void *arg)
     ffp_notify_str2(ffp, FFP_MSG_OPEN_INPUT, ic->iformat->name);
     if (scan_all_pmts_set)
         av_dict_set(&ffp->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+    if (early_video_params_set)
+        av_dict_set(&ffp->format_opts, "early_video_params", NULL, AV_DICT_MATCH_CASE);
     const AVDictionaryEntry *t = NULL;
 #if IS_FFMPEG_6
     while ((t = av_dict_iterate(ffp->format_opts, t)))
