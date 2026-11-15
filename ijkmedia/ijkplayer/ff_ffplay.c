@@ -4889,8 +4889,14 @@ static int read_thread(void *arg)
     }
     ic->interrupt_callback.callback = decode_interrupt_cb;
     ic->interrupt_callback.opaque = is;
+    /* scan_all_pmts 让 TS 解复用器等「全部节目的 PMT」都到齐才收工
+     * （mpegts.c 里只有 scan_all_pmts<=0 时才会清 NOHEADER 让
+     * find_stream_info 提前返回）。换台只要当前这一路，等多节目 PMT 是纯等。
+     * 开了 probe 早退/流式探测时把它关掉；其它场景保持原来的行为。 */
     if (!av_dict_get(ffp->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE)) {
-        av_dict_set(&ffp->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
+        av_dict_set(&ffp->format_opts, "scan_all_pmts",
+                    (ffp->probe_early_exit || ffp->probe_streaming) ? "0" : "1",
+                    AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
     if (av_stristart(is->filename, "rtmp", NULL) ||
