@@ -95,6 +95,8 @@
 /* 补开失败后的重试间隔与次数上限：参数不会突变，太多轮等于反复建 AudioTrack */
 #define VIDEO_FIRST_AUDIO_RETRY_MS (2000)
 #define VIDEO_FIRST_AUDIO_MAX_TRIES (3)
+/* 首帧直出：硬解首帧出来之前，队列空时最多等这么久就回头问一次解码器有没有输出 */
+#define FIRST_FRAME_POLL_MS (2)
 #define DEFAULT_MIN_FRAMES  50000
 #define MIN_MIN_FRAMES      2
 #define MAX_MIN_FRAMES      50000

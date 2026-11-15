@@ -140,10 +140,26 @@ void packet_queue_start(PacketQueue *q)
     SDL_UnlockMutex(q->mutex);
 }
 
+/* 持锁取出队头一个包；队列空返回 0 */
+static int packet_queue_pop_locked(PacketQueue *q, AVPacket *pkt, int *serial)
+{
+    MyAVPacketList pkt1;
+
+    if (av_fifo_read(q->pkt_list, &pkt1, 1) < 0)
+        return 0;
+    q->nb_packets--;
+    q->size -= pkt1.pkt->size + sizeof(pkt1);
+    q->duration -= FFMAX(pkt1.pkt->duration, MIN_PKT_DURATION);
+    av_packet_move_ref(pkt, pkt1.pkt);
+    if (serial)
+        *serial = pkt1.serial;
+    av_packet_free(&pkt1.pkt);
+    return 1;
+}
+
 /* return < 0 if aborted, 0 if no packet and > 0 if packet.  */
 int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
 {
-    MyAVPacketList pkt1;
     int ret;
 
     SDL_LockMutex(q->mutex);
@@ -153,15 +169,8 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
             ret = -1;
             break;
         }
-        
-        if (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0) {
-            q->nb_packets--;
-            q->size -= pkt1.pkt->size + sizeof(pkt1);
-            q->duration -= FFMAX(pkt1.pkt->duration, MIN_PKT_DURATION);
-            av_packet_move_ref(pkt, pkt1.pkt);
-            if (serial)
-                *serial = pkt1.serial;
-            av_packet_free(&pkt1.pkt);
+
+        if (packet_queue_pop_locked(q, pkt, serial)) {
             ret = 1;
             break;
         } else if (!block) {
@@ -170,6 +179,32 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
         } else {
             SDL_CondWait(q->cond, q->mutex);
         }
+    }
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+int packet_queue_get_timeout(PacketQueue *q, AVPacket *pkt, int *serial, uint32_t timeout_ms)
+{
+    int ret;
+    int waited = 0;
+
+    SDL_LockMutex(q->mutex);
+    for (;;) {
+        if (q->abort_request) {
+            ret = -1;
+            break;
+        }
+        if (packet_queue_pop_locked(q, pkt, serial)) {
+            ret = 1;
+            break;
+        }
+        if (waited) {
+            ret = 0;
+            break;
+        }
+        SDL_CondWaitTimeout(q->cond, q->mutex, timeout_ms);
+        waited = 1;
     }
     SDL_UnlockMutex(q->mutex);
     return ret;

@@ -35,5 +35,7 @@ void packet_queue_destroy(PacketQueue *q);
 void packet_queue_abort(PacketQueue *q);
 void packet_queue_start(PacketQueue *q);
 int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial);
+/* 限时取包：拿到返回 1，等满 timeout_ms 队列仍空返回 0，abort 返回 -1 */
+int packet_queue_get_timeout(PacketQueue *q, AVPacket *pkt, int *serial, uint32_t timeout_ms);
 
 #endif /* ff_packet_list_h */

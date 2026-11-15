@@ -277,6 +277,19 @@ static int decoder_replay_cached_keyframe(Decoder *d)
 }
 #endif
 
+/*
+ * 首帧还没出来时要不要轮询硬解输出。
+ * 只对硬解（MediaCodec 等，解码跑在别的线程，出帧不跟着送包走）、且还没有任何一帧
+ * 进画面队列时生效；软解要等下一包送进去才会出帧，轮询没用。packet-buffering 打开时
+ * 取包有缓冲语义，不碰。出过首帧之后就恢复原来的阻塞取包。
+ */
+static int decoder_poll_first_hw_frame(FFPlayer *ffp, Decoder *d)
+{
+    return ffp->first_frame_immediate && !ffp->packet_buffering &&
+           d->avctx && d->avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+           d->avctx->hw_device_ctx && !d->first_frame_decoded;
+}
+
 static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     
     int status = 0;
@@ -414,6 +427,7 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
         int pkt_from_queue = 0;
 #endif
+        int poll_only = 0;
         do {
             if (d->queue->nb_packets == 0)
                 SDL_CondSignal(d->empty_queue_cond);
@@ -444,7 +458,22 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
 #endif
             else {
                 int old_serial = d->pkt_serial;
-                if (packet_queue_get_or_buffering(ffp, d->queue, d->pkt, &d->pkt_serial, &d->finished) < 0) {
+                int got_pkt;
+                if (decoder_poll_first_hw_frame(ffp, d)) {
+                    /* 首帧直出：硬解的首帧还没出来、队列又空着时别死等下一个包。
+                     * MediaCodec 的输出只有 receive 时才会被取走，直播源按码率匀速来包，
+                     * 解好的首帧会在解码器里多躺一个甚至几个帧间隔。限时等包，
+                     * 超时就回头 receive 一次。 */
+                    got_pkt = packet_queue_get_timeout(d->queue, d->pkt, &d->pkt_serial,
+                                                       FIRST_FRAME_POLL_MS);
+                    if (got_pkt == 0) {
+                        poll_only = 1;
+                        break;
+                    }
+                } else {
+                    got_pkt = packet_queue_get_or_buffering(ffp, d->queue, d->pkt, &d->pkt_serial, &d->finished);
+                }
+                if (got_pkt < 0) {
                     status = -1;
                     goto abort_end;
                 }
@@ -472,6 +501,10 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                 break;
             av_packet_unref(d->pkt);
         } while (1);
+
+        /* 限时等包超时、手里没有新包：回到循环开头只 receive，不送包 */
+        if (poll_only)
+            continue;
 
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
         /* 重放结束，回到正常取包流程 */
