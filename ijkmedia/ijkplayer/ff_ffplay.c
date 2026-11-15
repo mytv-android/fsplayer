@@ -309,6 +309,8 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                                                 ? FFP_PROPV_DECODER_AVCODEC_HW
                                                 : FFP_PROPV_DECODER_AVCODEC;
                             
+                            if (ffp->is && !ffp->is->trace_first_vframe_at)
+                                ffp->is->trace_first_vframe_at = av_gettime_relative();
                             if (ffp->node_vdec->vdec_type == FFP_PROPV_DECODER_UNKNOWN) {
                                 ffp->node_vdec->vdec_type = vdec_type;
                                 ffp_notify_msg2(ffp, FFP_MSG_VIDEO_DECODER_OPEN, vdec_type);
@@ -541,6 +543,9 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                 }
             }
             int send = avcodec_send_packet(d->avctx, d->pkt);
+            if (send >= 0 && d->avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                ffp->is && !ffp->is->trace_first_vpkt_at)
+                ffp->is->trace_first_vpkt_at = av_gettime_relative();
             if (send == AVERROR(EAGAIN)) {
                 av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
                 d->packet_pending = 1;
@@ -638,6 +643,35 @@ static int ff_apply_subtitle_stream_change(FFPlayer *ffp)
     return r;
 }
 
+static int trace_ms_since(int64_t base, int64_t t)
+{
+    return (base > 0 && t > 0) ? (int)((t - base) / 1000) : -1;
+}
+
+/* 首帧上屏时把起播各段打成一行（相对 prepareAsync，毫秒，-1 = 没经过这一段）。
+ * prev_stop 是上一路 stop() 的收尾耗时，换台时它也算在用户等待里。 */
+static void log_startup_timeline(FFPlayer *ffp)
+{
+    VideoState *is = ffp->is;
+    int64_t base = ffp->trace_prepare_at;
+
+    if (!is)
+        return;
+    av_log(ffp, AV_LOG_INFO,
+           "startup timeline ms: read_thread=%d open_input=%d stream_info=%d video_open=%d "
+           "first_pkt=%d decoded=%d queued=%d display=%d rendered=%d prev_stop=%d\n",
+           trace_ms_since(base, is->read_start_at),
+           trace_ms_since(base, is->trace_open_input_at),
+           trace_ms_since(base, is->trace_stream_info_at),
+           trace_ms_since(base, is->trace_video_open_at),
+           trace_ms_since(base, is->trace_first_vpkt_at),
+           trace_ms_since(base, is->trace_first_vframe_at),
+           trace_ms_since(base, is->trace_first_vqueued_at),
+           trace_ms_since(base, is->trace_first_display_at),
+           trace_ms_since(base, av_gettime_relative()),
+           ffp->trace_last_stop_us > 0 ? (int)(ffp->trace_last_stop_us / 1000) : -1);
+}
+
 static void video_image_display2(FFPlayer *ffp)
 {
     VideoState *is = ffp->is;
@@ -670,13 +704,16 @@ static void video_image_display2(FFPlayer *ffp)
                 SDL_Delay(20);
             }
         }
+        if (!ffp->first_video_frame_rendered)
+            is->trace_first_display_at = av_gettime_relative();
         SDL_VoutDisplayYUVOverlay(ffp->vout, vp, sub_overlay);
         SDL_TextureOverlay_Release(&sub_overlay);
-        
+
         ffp->stat.vfps = SDL_SpeedSamplerAdd(&ffp->vfps_sampler, FFP_SHOW_VFPS_FFPLAY, "vfps[ffplay]");
         if (!ffp->first_video_frame_rendered) {
             ffp->first_video_frame_rendered = 1;
             ffp_notify_msg1(ffp, FFP_MSG_VIDEO_RENDERING_START);
+            log_startup_timeline(ffp);
         }
 
         if (is->latest_video_seek_load_serial == vp->frame_serial) {
@@ -754,12 +791,15 @@ static void stream_close(FFPlayer *ffp)
 {
     av_log(NULL, AV_LOG_INFO, "stream_close will close\n");
     VideoState *is = ffp->is;
+    /* 收尾分段计时：换台时 stop() 是同步的，这段全算在下一台的等待里 */
+    int64_t t_begin = av_gettime_relative(), t_read, t_refresh, t_audio, t_video, t_input;
     /* XXX: use a special url_shutdown call to abort parse cleanly */
     is->abort_request = 1;
     packet_queue_abort(&is->videoq);
     packet_queue_abort(&is->audioq);
     ff_sub_abort(is->ffSub);
     SDL_WaitThread(is->read_tid, NULL);
+    t_read = av_gettime_relative();
 
     /* 先等渲染线程退出再关解码器：renderer 还持有画面时关掉 MediaCodec，
      * 硬件 buffer 回收不完（hw_buffer_count != 0），实例既不入复用池也不 stop，
@@ -767,14 +807,18 @@ static void stream_close(FFPlayer *ffp)
      * （HDR 内容随之只能色调映射，看起来像"HDR 突然不支持了"）。 */
     av_log(NULL, AV_LOG_DEBUG, "wait for video_refresh_tid\n");
     SDL_WaitThread(is->video_refresh_tid, NULL);
+    t_refresh = av_gettime_relative();
 
     /* close each stream */
     if (is->audio_stream >= 0)
         stream_component_close(ffp, is->audio_stream);
+    t_audio = av_gettime_relative();
     if (is->video_stream >= 0)
         stream_component_close(ffp, is->video_stream);
+    t_video = av_gettime_relative();
 
     avformat_close_input(&is->ic);
+    t_input = av_gettime_relative();
 
     ff_sub_destroy(&is->ffSub);
     
@@ -801,7 +845,12 @@ static void stream_close(FFPlayer *ffp)
     av_free(is->filename);
     av_free(is);
     ffp->is = NULL;
-    av_log(NULL, AV_LOG_INFO, "stream_close did close\n");
+    ffp->trace_last_stop_us = av_gettime_relative() - t_begin;
+    av_log(NULL, AV_LOG_INFO,
+           "stream_close did close, ms: read_thread=%d refresh_thread=%d audio=%d video=%d input=%d total=%d\n",
+           (int)((t_read - t_begin) / 1000), (int)((t_refresh - t_read) / 1000),
+           (int)((t_audio - t_refresh) / 1000), (int)((t_video - t_audio) / 1000),
+           (int)((t_input - t_video) / 1000), (int)(ffp->trace_last_stop_us / 1000));
 }
 
 /* display the current picture, if any */
@@ -1946,6 +1995,7 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
          */
         if (is->videoq.serial == serial) {
             if (!is->viddec.first_frame_decoded) {
+                is->trace_first_vqueued_at = av_gettime_relative();
                 ALOGD("Video: first frame decoded\n");
                 ffp_notify_msg1(ffp, FFP_MSG_VIDEO_DECODED_START);
                 is->viddec.first_frame_decoded_time = SDL_GetTickHR();
@@ -4924,6 +4974,7 @@ static int read_thread(void *arg)
         goto fail;
     }
     
+    is->trace_open_input_at = av_gettime_relative();
     ffp_notify_str2(ffp, FFP_MSG_OPEN_INPUT, ic->iformat->name);
     if (scan_all_pmts_set)
         av_dict_set(&ffp->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
@@ -5000,6 +5051,7 @@ static int read_thread(void *arg)
             goto fail;
         }
     }
+    is->trace_stream_info_at = av_gettime_relative();
     if (ic->pb)
         ic->pb->eof_reached = 0; // FIXME hack, ffplay maybe should not use avio_feof() to test for the end
 
@@ -5161,6 +5213,7 @@ static int read_thread(void *arg)
     int video_opened = 0;
     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
         video_opened = stream_component_open(ffp, st_index[AVMEDIA_TYPE_VIDEO]) >= 0;
+        is->trace_video_open_at = av_gettime_relative();
     }
 
     ret = -1;
@@ -6350,6 +6403,7 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
      * （first_frame_immediate 也依赖它，不清就会失去"首帧直出"。） */
     ffp->first_video_frame_rendered = 0;
     ffp->first_audio_frame_rendered = 0;
+    ffp->trace_prepare_at = av_gettime_relative();
 
     if (av_stristart(file_name, "rtmp", NULL) ||
         av_stristart(file_name, "rtsp", NULL)) {

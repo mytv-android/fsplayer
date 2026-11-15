@@ -321,6 +321,15 @@ typedef struct VideoState {
     int64_t probe_streaming_audio_last_try;
     /* 读线程起跑时刻：video-first 推迟音频时用来兜底超时 */
     int64_t read_start_at;
+    /* 起播分段时刻（av_gettime_relative，0 = 还没到）。首帧上屏时打成一行日志，
+     * 真机换台慢在哪一段直接看 logcat，不用再加打点重编。 */
+    int64_t trace_open_input_at;
+    int64_t trace_stream_info_at;
+    int64_t trace_video_open_at;
+    int64_t trace_first_vpkt_at;
+    int64_t trace_first_vframe_at;
+    int64_t trace_first_vqueued_at;
+    int64_t trace_first_display_at;
     int force_refresh_sub_changed;//changed sub prefercence or close sub.
     int force_refresh_pic;//changed sub prefercence or close sub.
     int force_refresh;
@@ -599,6 +608,9 @@ typedef struct FFPlayer {
     int first_audio_frame_rendered;
     int sync_av_start;
     int first_frame_immediate;
+    /* 起播打点：prepareAsync 进来的时刻，以及上一路 stop 收尾花了多久（微秒） */
+    int64_t trace_prepare_at;
+    int64_t trace_last_stop_us;
 
     MessageQueue msg_queue;
 
