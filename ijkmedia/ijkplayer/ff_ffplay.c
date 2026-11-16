@@ -5631,6 +5631,12 @@ static int read_thread(void *arg)
         is->trace_read_phase = 1;
         ret = av_read_frame(ic, pkt);
         is->trace_read_phase = 0;
+        /* stop() 已在等这条线程退出：刚读到的包不再处理。否则下面会照常补开推迟的音轨
+         * （video-first 下首帧上屏后才开，换台往往就在这时），开完 stop 又立刻关掉，
+         * Pixel 上这一开一关要 15~35ms，全算在下一台的等待里。读失败的分支也一样，
+         * 里面还有最长 100ms 的等待。 */
+        if (is->abort_request)
+            break;
         if (ret < 0) {
             int pb_eof = 0;
             int pb_error = 0;
@@ -5851,7 +5857,7 @@ static int read_thread(void *arg)
                         /* 参数还得等这条音轨自己的包来解；这一次不算补开失败 */
                         audio_trigger = 0;
                     }
-                    if (audio_trigger && audio_open_now) {
+                    if (audio_trigger && audio_open_now && !is->abort_request) {
                         int pending = is->probe_streaming_pending_audio;
                         int audio_opened;
                         is->probe_streaming_pending_audio = -1;
