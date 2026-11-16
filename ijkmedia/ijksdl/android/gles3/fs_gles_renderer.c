@@ -241,7 +241,10 @@ static const char *video_src =
     "if(hdr!=0){vec3 v=max(rgb,vec3(0)); if(tf==1)v=vec3(pq(v.r),pq(v.g),pq(v.b))*200.; else "
     "if(tf==2)v=vec3(hlg(v.r),hlg(v.g),hlg(v.b))*20.; else v=pow(v,vec3(2.2));"
     "v=mat3(1.660642,-.124555,-.018174,-.587719,1.132951,-.100571,-.072778,-.008313,1.118771)*v; "
-    "float s=max(max(max(v.r,v.g),v.b),1e-6); rgb=v*(hable(s)/hable(20.))/s;}"
+    /* Tone-mapped result is linear light; the default framebuffer is plain
+     * 8-bit UNORM, so re-encode with the SDR OETF (1/2.2) like Vulkan/iOS do. */
+    "float s=max(max(max(v.r,v.g),v.b),1e-6); rgb=pow(max(v*(hable(s)/hable(20.))/s,vec3(0)),"
+    "vec3(1./2.2));}"
     "if(any(notEqual(adjust,vec3(1)))){rgb=(rgb-.5)*adjust.z+.5; rgb+=(.75*adjust.x-.5)/2.5-.1; "
     "vec3 intensity=rgb*vec3(.299,.587,.114); rgb=intensity+adjust.y*(rgb-intensity);} "
     "color=vec4(rgb,1);}\n";

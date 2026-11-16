@@ -70,6 +70,17 @@ vec3 rec_1886_eotf_vec(vec3 v)
     return vec3(rec_1886_eotf(v.r), rec_1886_eotf(v.g), rec_1886_eotf(v.b));
 }
 
+// 反过来：SDR 线性光 -> SDR 电信号（iOS hdr2sdr 的第 4 步 OETF）
+float rec_1886_inverse_eotf(float x)
+{
+    return x < 0.0 ? 0.0 : pow(x, 1.0 / 2.2);
+}
+
+vec3 rec_1886_inverse_eotf_vec(vec3 v)
+{
+    return vec3(rec_1886_inverse_eotf(v.r), rec_1886_inverse_eotf(v.g), rec_1886_inverse_eotf(v.b));
+}
+
 // ---- 色调映射 ----
 float tonemap_ACES(float x)
 {
@@ -122,7 +133,10 @@ vec3 hdr_direct(vec3 rgb_2020, int tf)
     return vec3(st_2084_oetf(linear.r), st_2084_oetf(linear.g), st_2084_oetf(linear.b));
 }
 
-// SDR 屏：EOTF -> 色域转到 BT.709 -> 色调映射（peak_luminance = 50，和 iOS 一致）
+// SDR 屏：EOTF -> 色域转到 BT.709 -> 色调映射（peak_luminance = 50，和 iOS 一致）-> OETF。
+// SDR 交换链是 8bit UNORM（不是 *_SRGB，硬件不会替我们编码），SDR 视频也是直接写电信号；
+// 色调映射的结果是线性光，漏了最后的 OETF 会被显示端再按 gamma 2.2 压一遍，
+// HLG/PQ 中间调只剩约 1/10 的亮度，整幅画面明显偏暗。
 vec3 hdr2sdr(vec3 rgb_2020, int tf)
 {
     vec3 linear;
@@ -134,5 +148,5 @@ vec3 hdr2sdr(vec3 rgb_2020, int tf)
     } else {
         linear = rec_1886_eotf_vec(rgb_2020);
     }
-    return tonemap(RGB2020_TO_RGB709 * linear);
+    return rec_1886_inverse_eotf_vec(tonemap(RGB2020_TO_RGB709 * linear));
 }

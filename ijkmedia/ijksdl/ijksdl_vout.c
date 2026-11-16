@@ -249,6 +249,14 @@ int SDL_VoutConvertFrame(SDL_Vout *vout, int dst_format, const AVFrame *inFrame,
     if (r == 0 && outFrame) {
         convert->frame->width  = inFrame->width;
         convert->frame->height = inFrame->height;
+        /* 色彩属性也只在创建转换器时拷过一次，而转换器跟着 vout 活过整个播放器：
+           换台（stop 后再 prepare）后会沿用上一路流的 colorspace/trc，
+           10bit 软解的 HLG/PQ 就可能被当成 SDR 渲染（或反过来）。每帧按源帧刷新。 */
+        convert->frame->color_range     = inFrame->color_range;
+        convert->frame->color_primaries = inFrame->color_primaries;
+        convert->frame->color_trc       = inFrame->color_trc;
+        convert->frame->colorspace      = inFrame->colorspace;
+        convert->frame->chroma_location = inFrame->chroma_location;
 #if defined(__APPLE__)
         // swscale（--disable-swscale-alpha 构建）丢掉的 alpha 自己补回来。
         // 必须在 width/height 赋值之后：补 alpha 是按目标帧尺寸逐行搬运的。
