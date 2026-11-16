@@ -51,7 +51,6 @@
 #include "libavcodec/bsf.h"
 #include "libswscale/swscale.h"
 #include "libavutil/opt.h"
-//#include "libavcodec/avfft.h"
 #include "libswresample/swresample.h"
 
 #if CONFIG_AUDIO_AVFILTER || CONFIG_VIDEO_AVFILTER
@@ -659,7 +658,7 @@ typedef struct FFPlayer {
 
     /* filters */
 #if CONFIG_VIDEO_AVFILTER
-    char *vfilters;
+    const char *vfilters;
     char *vfilter0;
     SDL_mutex  *vf_mutex;
     int         vf_changed;
@@ -927,6 +926,7 @@ int decoder_extradata_annexb(AVCodecContext *avctx, AVStream *st);
 void decoder_destroy(Decoder *d);
 void decoder_abort(Decoder *d, FrameQueue *fq);
 
+void show_dict_pretty(void *avcl, const char *tag, AVDictionary *dict);
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
 /* 关键帧封包缓存（issue #68）：硬解会话失效后从最近的关键帧重放 */
 void decoder_kpkt_cache_reset(Decoder *d);
