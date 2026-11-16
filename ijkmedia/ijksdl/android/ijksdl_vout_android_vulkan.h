@@ -58,6 +58,19 @@ SDL_Vout *SDL_VoutAndroid_CreateForVulkan(void);
 void SDL_VoutAndroid_SetAndroidSurface(JNIEnv *env, SDL_Vout *vout, jobject android_surface);
 
 /*
+ * MediaCodec 直出到应用窗口（SurfaceView/TextureView），和 IJK、Media3 一样由系统合成。
+ * HasWindow：当前有应用窗口可直出。
+ * EnterMediaCodecDirect：渲染器断开窗口，返回应用 Surface 的 NewGlobalRef 交给
+ *   MediaCodec（调用方负责释放）；没有窗口时返回 NULL，调用方退回其它通路。
+ * LeaveMediaCodecDirect：窗口还给渲染器（显示到软解帧时 vout 也会自动退出直出）。
+ * IsMediaCodecDirectLost：直出期间应用换了窗口，需要按新窗口重开视频解码器。
+ */
+int SDL_VoutAndroid_HasWindow(SDL_Vout *vout);
+jobject SDL_VoutAndroid_EnterMediaCodecDirect(JNIEnv *env, SDL_Vout *vout);
+void SDL_VoutAndroid_LeaveMediaCodecDirect(SDL_Vout *vout);
+int SDL_VoutAndroid_IsMediaCodecDirectLost(SDL_Vout *vout);
+
+/*
  * 硬解零拷贝通路是否可用（Vulkan 1.1 + AImageReader + 外部显存扩展）。
  * 不可用时上层应保持软解。
  */

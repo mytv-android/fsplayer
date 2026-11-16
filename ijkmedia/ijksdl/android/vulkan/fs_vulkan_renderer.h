@@ -120,6 +120,9 @@ FSVulkanRenderer *fs_vulkan_renderer_create(void);
 /* 设置/更新渲染目标窗口；首次设置时创建 swapchain 与渲染资源。 */
 int fs_vulkan_renderer_set_surface(FSVulkanRenderer *r, ANativeWindow *window);
 
+/* 让出窗口（销毁 surface/交换链并断开连接），供 MediaCodec 直接输出到同一窗口。 */
+void fs_vulkan_renderer_release_surface(FSVulkanRenderer *r);
+
 /*
  * 渲染一帧 YUV 画面。
  * frame 为解码帧（YUV420P 或 NV12，其它格式内部先转 YUV420P）。

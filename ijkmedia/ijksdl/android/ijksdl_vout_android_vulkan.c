@@ -29,8 +29,10 @@
 #include <stdlib.h>
 #include <sys/system_properties.h>
 #include <android/native_window_jni.h>
+#include <libavcodec/mediacodec.h>
 
 #include "ijksdl/ijksdl_vout_internal.h"
+#include "ijksdl_android_jni.h"
 #include "ijksdl/ijksdl_gpu.h"
 #include "ijksdl/ffmpeg/ijksdl_vout_overlay_ffmpeg.h"
 #include "ijkplayer/ff_ffplay_def.h"
@@ -47,6 +49,16 @@ struct SDL_Vout_Opaque {
     FSGLESRenderer *gles;
     SDL_GPU *gpu;                 /* 字幕纹理/FBO，与对应后端共享 GPU 上下文 */
     ANativeWindow *native_window;
+    /*
+     * MediaCodec 直出：硬解输出直接交给应用的 SurfaceView/TextureView（和 IJK、Media3
+     * 一样由 SurfaceFlinger 合成，10bit/HDR 由系统处理），渲染器让出窗口，只负责软解帧。
+     * 一个窗口同时只能连一个生产者，所以进出直出都要先断开另一方。
+     */
+    jobject jsurface;              /* 应用 Surface 的 global ref，交给 MediaCodec */
+    int mc_direct;                 /* 窗口当前归 MediaCodec，渲染器已断开 */
+    ANativeWindow *direct_window;  /* 解码器绑定的窗口（持有引用）；与 native_window 不同说明窗口换了 */
+    int reattach_pending;          /* 渲染器还没接上窗口（上一个生产者可能还没断开），逐帧重试 */
+    int direct_lost;               /* 直出期间应用换了窗口；读线程每轮都查，不拿锁，原子读写 */
     int initialized;
     int requested_renderer;
     int gpu_exported;
@@ -103,6 +115,16 @@ static void vout_free_l(SDL_Vout *vout)
         if (opaque->native_window) {
             ANativeWindow_release(opaque->native_window);
             opaque->native_window = NULL;
+        }
+        if (opaque->direct_window) {
+            ANativeWindow_release(opaque->direct_window);
+            opaque->direct_window = NULL;
+        }
+        if (opaque->jsurface) {
+            JNIEnv *env = NULL;
+            if (SDL_JNI_SetupThreadEnv(&env) == JNI_OK)
+                SDL_JNI_DeleteGlobalRefP(env, &opaque->jsurface);
+            opaque->jsurface = NULL;
         }
 #if IS_TILEGRID_HEIC_ENABLED
         av_frame_free(&opaque->tile_canvas);
@@ -274,6 +296,40 @@ done:
 }
 #endif /* IS_TILEGRID_HEIC_ENABLED */
 
+/* 渲染器接上 / 断开当前窗口；调用方持有 vout->mutex */
+static int renderer_attach_l(SDL_Vout_Opaque *o)
+{
+    if (o->gles)
+        return fs_gles_renderer_set_surface(o->gles, o->native_window);
+    if (o->renderer)
+        return fs_vulkan_renderer_set_surface(o->renderer, o->native_window);
+    return -1;
+}
+
+static void renderer_detach_l(SDL_Vout_Opaque *o)
+{
+    if (o->gles)
+        fs_gles_renderer_set_surface(o->gles, NULL);
+    else if (o->renderer)
+        fs_vulkan_renderer_release_surface(o->renderer);
+}
+
+/* 窗口还给渲染器。MediaCodec 可能还没断开（旧实例在后台 stop），接不上就逐帧重试。 */
+static void leave_direct_l(SDL_Vout_Opaque *o)
+{
+    if (!o->mc_direct)
+        return;
+    o->mc_direct = 0;
+    __atomic_store_n(&o->direct_lost, 0, __ATOMIC_RELEASE);
+    if (o->direct_window) {
+        ANativeWindow_release(o->direct_window);
+        o->direct_window = NULL;
+    }
+    o->reattach_pending = o->native_window && renderer_attach_l(o) != 0;
+    ALOGI("vout: mediacodec direct output off, renderer %s\n",
+          o->reattach_pending ? "attach pending" : "attached");
+}
+
 static int vout_display_overlay_l(SDL_Vout *vout, const Frame *frame, SDL_TextureOverlay *sub_overlay)
 {
     SDL_Vout_Opaque *opaque = vout->opaque;
@@ -294,6 +350,31 @@ static int vout_display_overlay_l(SDL_Vout *vout, const Frame *frame, SDL_Textur
 
     AVFrame *av_frame = (frame && frame->frame) ? frame->frame : NULL;
     int disp_w = 0, disp_h = 0;
+
+    if (opaque->mc_direct) {
+        /* 窗口在 MediaCodec 手里，渲染器没有可画的地方。画面队列清空后重刷的空帧
+           （format 为 NONE、没有数据）也不算软解帧，不能据此把窗口抢回来。 */
+        if (!av_frame ||
+            (av_frame->format != AV_PIX_FMT_MEDIACODEC && !av_frame->data[0]))
+            return 0;
+        if (av_frame->format == AV_PIX_FMT_MEDIACODEC) {
+            /* 到点上屏：让 MediaCodec 把这一帧直接送进应用窗口。窗口已换或已销毁时
+               只归还不渲染，免得往废弃的 Surface 里送（读线程会按新窗口重开解码器）。 */
+            AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)av_frame->data[3];
+            int render = opaque->native_window && opaque->native_window == opaque->direct_window;
+            if (buffer)
+                av_mediacodec_release_buffer(buffer, render);
+            return 0;
+        }
+        /* 直出期间来了软解帧（换台后改走软解等）：窗口还给渲染器 */
+        leave_direct_l(opaque);
+    }
+    if (opaque->reattach_pending) {
+        if (!opaque->native_window || renderer_attach_l(opaque) != 0)
+            return -1;
+        opaque->reattach_pending = 0;
+        ALOGI("vout: renderer attached after retry\n");
+    }
 
 #if IS_TILEGRID_HEIC_ENABLED
     /* HEIC tile grid：每个 tile 是独立的一帧，先合成成整张图再当普通单帧显示；
@@ -543,17 +624,85 @@ void SDL_VoutAndroid_SetAndroidSurface(JNIEnv *env, SDL_Vout *vout, jobject andr
         ANativeWindow_release(opaque->native_window);
         opaque->native_window = NULL;
     }
+    SDL_JNI_DeleteGlobalRefP(env, &opaque->jsurface);
 
     if (android_surface) {
         opaque->native_window = ANativeWindow_fromSurface(env, android_surface);
+        if (opaque->native_window)
+            opaque->jsurface = (*env)->NewGlobalRef(env, android_surface);
     }
 
-    if (opaque->gles)
-        fs_gles_renderer_set_surface(opaque->gles, opaque->native_window);
-    else if (opaque->renderer)
-        fs_vulkan_renderer_set_surface(opaque->renderer, opaque->native_window);
+    if (opaque->mc_direct) {
+        /* 窗口归 MediaCodec，渲染器不接；窗口换了由读线程按新窗口重开解码器 */
+        __atomic_store_n(&opaque->direct_lost,
+                         opaque->native_window && opaque->native_window != opaque->direct_window,
+                         __ATOMIC_RELEASE);
+        ALOGI("vout: surface %p while mediacodec direct on %p\n",
+              opaque->native_window, opaque->direct_window);
+    } else {
+        /* 窗口为空也要告诉渲染器（停止往已销毁的窗口画），否则渲染线程会卡在旧窗口上 */
+        int attached = renderer_attach_l(opaque);
+        opaque->reattach_pending = opaque->native_window && attached != 0;
+    }
 
     SDL_UnlockMutex(vout->mutex);
+}
+
+int SDL_VoutAndroid_HasWindow(SDL_Vout *vout)
+{
+    if (!vout || !vout->opaque)
+        return 0;
+    SDL_LockMutex(vout->mutex);
+    int has = vout->opaque->native_window != NULL && vout->opaque->jsurface != NULL;
+    SDL_UnlockMutex(vout->mutex);
+    return has;
+}
+
+jobject SDL_VoutAndroid_EnterMediaCodecDirect(JNIEnv *env, SDL_Vout *vout)
+{
+    if (!env || !vout || !vout->opaque)
+        return NULL;
+    SDL_LockMutex(vout->mutex);
+    SDL_Vout_Opaque *o = vout->opaque;
+    jobject surface = NULL;
+    if (o->native_window && o->jsurface) {
+        surface = (*env)->NewGlobalRef(env, o->jsurface);
+        if (surface) {
+            if (!o->mc_direct) {
+                /* MediaCodec configure 时要 connect 窗口，渲染器必须先断开 */
+                renderer_detach_l(o);
+                o->mc_direct = 1;
+                ALOGI("vout: mediacodec direct output on %p\n", o->native_window);
+            }
+            o->reattach_pending = 0;
+            if (o->direct_window != o->native_window) {
+                if (o->direct_window)
+                    ANativeWindow_release(o->direct_window);
+                o->direct_window = o->native_window;
+                ANativeWindow_acquire(o->direct_window);
+            }
+            __atomic_store_n(&o->direct_lost, 0, __ATOMIC_RELEASE);
+        }
+    }
+    SDL_UnlockMutex(vout->mutex);
+    return surface;
+}
+
+void SDL_VoutAndroid_LeaveMediaCodecDirect(SDL_Vout *vout)
+{
+    if (!vout || !vout->opaque)
+        return;
+    SDL_LockMutex(vout->mutex);
+    leave_direct_l(vout->opaque);
+    SDL_UnlockMutex(vout->mutex);
+}
+
+int SDL_VoutAndroid_IsMediaCodecDirectLost(SDL_Vout *vout)
+{
+    if (!vout || !vout->opaque)
+        return 0;
+    /* 读线程每读一个包都会查；不拿 vout 锁，免得跟渲染线程的显示抢锁拖慢读包 */
+    return __atomic_load_n(&vout->opaque->direct_lost, __ATOMIC_ACQUIRE);
 }
 
 int SDL_VoutAndroid_IsOpenGLES3(SDL_Vout *vout)

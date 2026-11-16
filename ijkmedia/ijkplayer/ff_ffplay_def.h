@@ -275,6 +275,12 @@ typedef struct Decoder {
     Uint64 start_seek_time;
     
     int hw_failed_count;
+
+    /* Android MediaCodec 直出应用窗口（不经渲染器），见 ffp_android_mediacodec_init */
+    int mc_direct;
+    /* 重开解码器后从下一个关键帧开始送包，免得硬解拿 P/B 帧起步花屏；超出上限不再等 */
+    int wait_keyframe;
+    int wait_keyframe_dropped;
     
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
     /**

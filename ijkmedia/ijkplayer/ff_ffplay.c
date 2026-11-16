@@ -325,6 +325,10 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                                              frame->format == AV_PIX_FMT_MEDIACODEC)
                                                 ? FFP_PROPV_DECODER_AVCODEC_HW
                                                 : FFP_PROPV_DECODER_AVCODEC;
+                            /* MediaCodec 直出应用窗口：画面不经渲染器，内核字幕也画不上去，
+                               单独报出来让上层自己显示字幕 */
+                            if (frame->format == AV_PIX_FMT_MEDIACODEC && d->mc_direct)
+                                vdec_type = FFP_PROPV_DECODER_MEDIACODEC;
                             
                             if (ffp->is && !ffp->is->trace_first_vframe_at)
                                 ffp->is->trace_first_vframe_at = av_gettime_relative();
@@ -509,6 +513,19 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
         /* 限时等包超时、手里没有新包：回到循环开头只 receive，不送包 */
         if (poll_only)
             continue;
+
+        if (d->wait_keyframe) {
+            /* 空包（EOF 冲刷）照常送，否则点播到结尾解码器排不空 */
+            if (d->pkt->data && !(d->pkt->flags & AV_PKT_FLAG_KEY) &&
+                d->wait_keyframe_dropped < 1000) {
+                d->wait_keyframe_dropped++;
+                av_packet_unref(d->pkt);
+                continue;
+            }
+            av_log(d->avctx, AV_LOG_INFO, "video restart: %d packets dropped before keyframe\n",
+                   d->wait_keyframe_dropped);
+            d->wait_keyframe = 0;
+        }
 
 #if FFP_APPLE_MOBILE_HWDEC_RECOVERY
         /* 重放结束，回到正常取包流程 */
@@ -3648,29 +3665,46 @@ static void mediacodec_device_free(AVHWDeviceContext *ctx)
     ctx->user_opaque = NULL;
 }
 
-/*
- * 给 avctx 挂上 MediaCodec 硬解：
- * - 解码输出目标是渲染器内部的 AImageReader Surface（零拷贝的源头）
- * - get_format 选定 AV_PIX_FMT_MEDIACODEC，帧不落 CPU 内存
- * 返回 0 表示已启用，非 0 表示保持软解。
- */
-static int ffp_android_mediacodec_init(FFPlayer *ffp, AVCodecContext *avctx, const AVCodec *codec)
+/* 用输出 Surface（global ref，所有权转给设备上下文）建 MediaCodec 设备并挂到 avctx */
+static int ffp_android_mediacodec_attach(AVCodecContext *avctx, jobject surface)
 {
-    if (!ffp->vout || !SDL_VoutAndroid_IsMediaCodecSupported(ffp->vout)) {
-        ALOGW("android: mediacodec zero-copy unsupported by vout\n");
+    AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
+    if (!device_ref) {
+        JNIEnv *env = NULL;
+        if (JNI_OK == SDL_JNI_SetupThreadEnv(&env))
+            (*env)->DeleteGlobalRef(env, surface);
         return -1;
     }
 
-    /* The external-texture path is SDR RGBA. Preserve HDR precision by using
-     * software decode/tone mapping instead of silently sampling it as SDR. */
-    if (SDL_VoutAndroid_IsOpenGLES3(ffp->vout) &&
-        (avctx->colorspace == AVCOL_SPC_BT2020_NCL ||
-         avctx->colorspace == AVCOL_SPC_BT2020_CL ||
-         avctx->color_trc == AVCOL_TRC_SMPTE2084 ||
-         avctx->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
-        ALOGI("android: ES3 HDR stream uses software tone mapping\n");
+    AVHWDeviceContext *dev_ctx = (AVHWDeviceContext *) device_ref->data;
+    AVMediaCodecDeviceContext *hwctx = dev_ctx->hwctx;
+    hwctx->surface = surface;
+
+    /* FFmpeg 解码时会自行再取一份 global ref；这一份由我们在 device 释放时回收。 */
+    dev_ctx->free = mediacodec_device_free;
+
+    if (av_hwdevice_ctx_init(device_ref) < 0) {
+        av_buffer_unref(&device_ref);
         return -1;
     }
+
+    avctx->hw_device_ctx = device_ref;
+    avctx->get_format = get_hw_format_mediacodec;
+    return 0;
+}
+
+/*
+ * 给 avctx 挂上 MediaCodec 硬解，get_format 选定 AV_PIX_FMT_MEDIACODEC，帧不落 CPU 内存。
+ * 输出目标：
+ * - 优先直出应用的 SurfaceView/TextureView（同 IJK、Media3）：到点 releaseOutputBuffer
+ *   上屏，由 SurfaceFlinger 合成，10bit/HDR 的格式与色彩由系统按解码器输出处理；
+ * - 没有应用窗口时退回渲染器内部的 AImageReader Surface（Vulkan/ES3 零拷贝采样）。
+ * 返回 1 = 直出，0 = AImageReader，负数 = 保持软解。
+ */
+static int ffp_android_mediacodec_init(FFPlayer *ffp, AVCodecContext *avctx, const AVCodec *codec)
+{
+    if (!ffp->vout)
+        return -1;
 
     enum AVHWDeviceType type = av_hwdevice_find_type_by_name("mediacodec");
     if (type == AV_HWDEVICE_TYPE_NONE)
@@ -3695,6 +3729,31 @@ static int ffp_android_mediacodec_init(FFPlayer *ffp, AVCodecContext *avctx, con
     JNIEnv *env = NULL;
     if (JNI_OK != SDL_JNI_SetupThreadEnv(&env))
         return -1;
+
+    /* 有应用窗口就直出：渲染器先断开窗口，解码器 configure 时接上去 */
+    jobject surface = SDL_VoutAndroid_EnterMediaCodecDirect(env, ffp->vout);
+    if (surface) {
+        ALOGI("android: mediacodec outputs to app surface\n");
+        return ffp_android_mediacodec_attach(avctx, surface) == 0 ? 1 : -1;
+    }
+    /* 没有窗口：这一路走 AImageReader，帧要经渲染器显示 */
+    SDL_VoutAndroid_LeaveMediaCodecDirect(ffp->vout);
+
+    if (!SDL_VoutAndroid_IsMediaCodecSupported(ffp->vout)) {
+        ALOGW("android: mediacodec zero-copy unsupported by vout\n");
+        return -1;
+    }
+
+    /* The external-texture path is SDR RGBA. Preserve HDR precision by using
+     * software decode/tone mapping instead of silently sampling it as SDR. */
+    if (SDL_VoutAndroid_IsOpenGLES3(ffp->vout) &&
+        (avctx->colorspace == AVCOL_SPC_BT2020_NCL ||
+         avctx->colorspace == AVCOL_SPC_BT2020_CL ||
+         avctx->color_trc == AVCOL_TRC_SMPTE2084 ||
+         avctx->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
+        ALOGI("android: ES3 HDR stream uses software tone mapping\n");
+        return -1;
+    }
 
     /* 读端缓冲的色彩空间要在解码器开始输出前声明：FS 不是把 MediaCodec 直接接到
        应用 SurfaceView（那样由 SurfaceFlinger 负责），而是接自建 AImageReader 再用
@@ -3727,36 +3786,14 @@ static int ffp_android_mediacodec_init(FFPlayer *ffp, AVCodecContext *avctx, con
                                             avctx->color_trc,
                                             avctx->colorspace);
 
-    jobject surface = SDL_VoutAndroid_GetMediaCodecSurface(env, ffp->vout);
+    jobject reader_surface = SDL_VoutAndroid_GetMediaCodecSurface(env, ffp->vout);
+    if (!reader_surface)
+        return -1;
+    surface = (*env)->NewGlobalRef(env, reader_surface);
+    (*env)->DeleteLocalRef(env, reader_surface);
     if (!surface)
         return -1;
-
-    AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
-    if (!device_ref) {
-        (*env)->DeleteLocalRef(env, surface);
-        return -1;
-    }
-
-    AVHWDeviceContext *dev_ctx = (AVHWDeviceContext *) device_ref->data;
-    AVMediaCodecDeviceContext *hwctx = dev_ctx->hwctx;
-    hwctx->surface = (*env)->NewGlobalRef(env, surface);
-    (*env)->DeleteLocalRef(env, surface);
-    if (!hwctx->surface) {
-        av_buffer_unref(&device_ref);
-        return -1;
-    }
-
-    /* FFmpeg 解码时会自行再取一份 global ref；这一份由我们在 device 释放时回收。 */
-    dev_ctx->free = mediacodec_device_free;
-
-    if (av_hwdevice_ctx_init(device_ref) < 0) {
-        av_buffer_unref(&device_ref);
-        return -1;
-    }
-
-    avctx->hw_device_ctx = device_ref;
-    avctx->get_format = get_hw_format_mediacodec;
-    return 0;
+    return ffp_android_mediacodec_attach(avctx, surface) == 0 ? 0 : -1;
 }
 #endif
 
@@ -4354,6 +4391,7 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
 #if defined(__ANDROID__)
     int android_mc_attempted = 0;
     int android_mc_disabled = 0;
+    int android_mc_direct = 0;
 #endif
     AVDictionary *opts = NULL;
     int sample_rate;
@@ -4370,6 +4408,7 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
 #if defined(__ANDROID__)
 reopen_android_decoder:
     stream_lowres = ffp->lowres;
+    android_mc_direct = 0;
 #endif
     avctx = avcodec_alloc_context3(NULL);
     if (!avctx)
@@ -4436,7 +4475,8 @@ reopen_android_decoder:
     if (!android_mc_disabled && !forced_codec_name &&
         avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
         !(st->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
-        SDL_VoutAndroid_IsMediaCodecSupported(ffp->vout) &&
+        (SDL_VoutAndroid_HasWindow(ffp->vout) ||
+         SDL_VoutAndroid_IsMediaCodecSupported(ffp->vout)) &&
         ffp_android_mediacodec_wanted(ffp, avctx->codec_id)) {
         const char *mc_name = ffp_android_mediacodec_decoder_name(avctx->codec_id);
         const AVCodec *mc_codec = mc_name ? avcodec_find_decoder_by_name(mc_name) : NULL;
@@ -4506,9 +4546,11 @@ reopen_android_decoder:
         strstr(codec->name, "_mediacodec") &&
         ffp_android_mediacodec_wanted(ffp, avctx->codec_id)) {
         ret = ffp_android_mediacodec_init(ffp, avctx, codec);
-        if (ret == 0)
-            ALOGI("try use mediacodec accel: %s\n", codec->name);
-        else if (android_mc_attempted)
+        if (ret >= 0) {
+            android_mc_direct = ret;
+            ALOGI("try use mediacodec accel: %s (%s)\n", codec->name,
+                  android_mc_direct ? "surface output" : "image reader");
+        } else if (android_mc_attempted)
             goto retry_android_software;
 
         /*
@@ -4687,6 +4729,12 @@ retry_android_software:
          */
         if (strstr(codec->name, "_mediacodec"))
             decoder_bsf_init(&is->viddec, avctx, st);
+#if defined(__ANDROID__)
+        is->viddec.mc_direct = android_mc_direct;
+        /* 这一路不直出（软解 / AImageReader / 封面图）：窗口还给渲染器 */
+        if (!android_mc_direct)
+            SDL_VoutAndroid_LeaveMediaCodecDirect(ffp->vout);
+#endif
 
         if ((ret = decoder_start(&is->viddec, video_thread, ffp, "ff_video_dec")) < 0)
             goto out;
@@ -5065,6 +5113,32 @@ static void subtile_update_ic(FFPlayer *ffp, VideoState *is, int *st_index) {
         }
     }
 }
+
+#if defined(__ANDROID__)
+/*
+ * MediaCodec 直出时解码器在 configure 时就绑死了窗口（FFmpeg 没有 setOutputSurface），
+ * 应用换了窗口（Surface 销毁重建、换了 View）只能关掉视频解码器、按新窗口重开。
+ * 点播 seek 回当前位置从关键帧起解；直播从下一个关键帧开始送包。
+ */
+static void android_reopen_video_for_new_surface(FFPlayer *ffp)
+{
+    VideoState *is = ffp->is;
+    int stream = is->video_stream;
+    long pos = ffp_get_current_position_l(ffp);
+    int seekable = !is->realtime && ffp_get_duration_l(ffp) > 0;
+
+    av_log(ffp, AV_LOG_INFO, "android: app surface changed, reopen video decoder (seek=%d pos=%ld)\n",
+           seekable, pos);
+    stream_component_close(ffp, stream);
+    if (stream_component_open(ffp, stream) < 0) {
+        av_log(ffp, AV_LOG_ERROR, "android: reopen video decoder failed\n");
+        return;
+    }
+    is->viddec.wait_keyframe = 1;
+    if (seekable)
+        ffp_seek_to_l(ffp, pos);
+}
+#endif
 
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
@@ -5492,6 +5566,11 @@ static int read_thread(void *arg)
             SDL_Delay(10);
             continue;
         }
+#endif
+#if defined(__ANDROID__)
+        if (is->video_stream >= 0 && is->viddec.mc_direct &&
+            SDL_VoutAndroid_IsMediaCodecDirectLost(ffp->vout))
+            android_reopen_video_for_new_surface(ffp);
 #endif
         if (is->seek_req) {
             int64_t seek_target_origin = is->seek_pos;

@@ -1500,6 +1500,9 @@ fail:
     return NULL;
 }
 
+static int rebuild_swapchain(FSVulkanRenderer *r);
+static void destroy_surface_swapchain(FSVulkanRenderer *r);
+
 int fs_vulkan_renderer_set_surface(FSVulkanRenderer *r, ANativeWindow *window)
 {
     if (!r)
@@ -1514,8 +1517,26 @@ int fs_vulkan_renderer_set_surface(FSVulkanRenderer *r, ANativeWindow *window)
         return 0;
     }
 
-    if (create_surface_swapchain(r) != VK_SUCCESS)
+    /* 渲染资源建过了（换了窗口，或让给 MediaCodec 直出后重新接管窗口）：只重建
+       surface / 交换链 / framebuffer，render pass 与管线沿用。旧 VkSurfaceKHR 先销毁，
+       否则它还连着窗口（Android 上创建即 connect、销毁才 disconnect），同一窗口再建会
+       报 NATIVE_WINDOW_IN_USE，旧对象也一直泄漏。 */
+    if (r->render_pass != VK_NULL_HANDLE) {
+        if (rebuild_swapchain(r) != 0) {
+            destroy_surface_swapchain(r);
+            return -1;
+        }
+        r->swapchain_dirty = 0;
+        r->surface_ready = 1;
+        ALOGI("FSVulkanRenderer: surface attached, %ux%u\n",
+              r->swapchain_extent.width, r->swapchain_extent.height);
+        return 0;
+    }
+
+    if (create_surface_swapchain(r) != VK_SUCCESS) {
+        destroy_surface_swapchain(r);   /* 建了一半也别占着窗口 */
         return -1;
+    }
     if (create_render_pass(r) != VK_SUCCESS)
         return -1;
     if (create_pipeline(r) != VK_SUCCESS)
@@ -3022,6 +3043,21 @@ static void destroy_surface_swapchain(FSVulkanRenderer *r)
         r->surface = VK_NULL_HANDLE;
     }
     r->image_count = 0;
+}
+
+/*
+ * 让出窗口：销毁 surface / 交换链，断开与窗口的生产者连接，MediaCodec 才能直接
+ * 接到同一个窗口上输出。render pass / 管线保留，之后 set_surface 重新接管时只重建交换链。
+ */
+void fs_vulkan_renderer_release_surface(FSVulkanRenderer *r)
+{
+    if (!r)
+        return;
+    if (r->device)
+        vkDeviceWaitIdle(r->device);
+    destroy_surface_swapchain(r);
+    r->window = NULL;
+    r->surface_ready = 0;
 }
 
 /* Android surface（window）的当前尺寸是否已经和交换链不再一致 */
