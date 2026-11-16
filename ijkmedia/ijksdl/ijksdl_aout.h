@@ -57,6 +57,10 @@ struct SDL_Aout {
     void   (*func_set_automatically_setup_audio_session)(SDL_Aout *aout, bool automaticallySetupAudioSession);
     // Android only
     int    (*func_get_audio_session_id)(SDL_Aout *aout);
+    /* 可选：叫停正在等音频设备建好的 open，让它立刻失败返回 */
+    void   (*func_abort_open)(SDL_Aout *aout);
+    /* 可选：确认回调已经停下后立刻返回，关设备和释放交给后台线程；调完 aout 不能再用 */
+    void   (*func_free_async)(SDL_Aout *aout);
 };
 
 int SDL_AoutOpenAudio(SDL_Aout *aout, const SDL_AudioSpec *desired, SDL_AudioSpec *obtained);
@@ -66,6 +70,9 @@ void SDL_AoutSetStereoVolume(SDL_Aout *aout, float left_volume, float right_volu
 void SDL_AoutCloseAudio(SDL_Aout *aout);
 void SDL_AoutFree(SDL_Aout *aout);
 void SDL_AoutFreeP(SDL_Aout **paout);
+void SDL_AoutAbortOpen(SDL_Aout *aout);
+/* 支持异步释放时交给后台并把 *paout 置空；不支持时什么都不做，照旧同步关 */
+void SDL_AoutFreeAsyncP(SDL_Aout **paout);
 
 double SDL_AoutGetLatencySeconds(SDL_Aout *aout);
 void   SDL_AoutSetDefaultLatencySeconds(SDL_Aout *aout, double latency);

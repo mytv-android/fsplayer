@@ -841,6 +841,8 @@ static void stream_close(FFPlayer *ffp)
     packet_queue_abort(&is->videoq);
     packet_queue_abort(&is->audioq);
     ff_sub_abort(is->ffSub);
+    /* 读线程可能正在补开音轨、等 AudioTrack 建好（真机 10~20ms），叫停这次等待 */
+    SDL_AoutAbortOpen(ffp->aout);
     SDL_WaitThread(is->read_tid, NULL);
     t_read = av_gettime_relative();
 
@@ -851,6 +853,17 @@ static void stream_close(FFPlayer *ffp)
     av_log(NULL, AV_LOG_DEBUG, "wait for video_refresh_tid\n");
     SDL_WaitThread(is->video_refresh_tid, NULL);
     t_refresh = av_gettime_relative();
+
+    /* 音频输出整个交给后台收尾：这里只确认回调已经停下，打断 write、join 音频线程、
+     * 释放 AudioTrack 都不再算进下一台的等待（同步关每次 11~16ms）。ffp->aout 随之置空，
+     * 下一次 prepare 会新建一个；不支持异步释放的输出（OpenSL ES）照旧在下面同步关。
+     *
+     * 回调可能正卡在 frame_queue_peek_readable 等 sampq 来帧：它等的是 sampq 自己的 cond，
+     * 上面 packet_queue_abort(&is->audioq) 不会叫醒它，原来要到 stream_component_close 里的
+     * decoder_abort 才 signal。异步关闭要拿回调那把锁，先在这里叫醒（audioq 已 abort，
+     * 醒来直接返回），否则会一直等下去。 */
+    frame_queue_signal(&is->sampq);
+    SDL_AoutFreeAsyncP(&ffp->aout);
 
     /* close each stream */
     if (is->audio_stream >= 0)

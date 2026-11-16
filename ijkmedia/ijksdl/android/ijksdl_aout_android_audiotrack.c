@@ -58,6 +58,12 @@ typedef struct SDL_Aout_Opaque {
     volatile bool pause_on;
     volatile bool abort_request;
     bool loop_exited;           /* 音频线程已退出写循环、不再碰 AudioTrack 的 write；受 wakeup_mutex 保护 */
+    bool created;               /* Java AudioTrack 已在音频线程上建好；受 wakeup_mutex 保护 */
+    bool create_failed;
+    bool open_aborted;          /* stream_close 叫停了正在等 AudioTrack 建好的 open；受 wakeup_mutex 保护 */
+    /* 音频线程调回调时持有。回调读的是 ffp->is，下一台会换成新的：异步关闭前拿一次这把锁，
+       确认回调已经停下、之后也不会再进 */
+    SDL_mutex *cblk_mutex;
 
     volatile bool need_set_volume;
     volatile float left_volume;
@@ -128,6 +134,27 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
 
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 
+    /* AudioTrack 在这条线程上建（见 aout_open_audio_n）：建好或失败都要告诉在等的 open */
+    bool created = SDL_Android_AudioTrack_create(env, atrack) == 0;
+    int session_id = created ? SDL_Android_AudioTrack_getAudioSessionId(env, atrack) : 0;
+    SDL_LockMutex(opaque->wakeup_mutex);
+    if (created) {
+        opaque->audio_session_id = session_id;
+        opaque->created = true;
+    } else {
+        opaque->atrack = NULL;
+        opaque->create_failed = true;
+        opaque->loop_exited = true;
+    }
+    SDL_CondBroadcast(opaque->wakeup_cond);
+    SDL_UnlockMutex(opaque->wakeup_mutex);
+    if (!created) {
+        ALOGE("aout_thread: failed to new AudioTrack()");
+        SDL_Android_AudioTrack_free(env, atrack);
+        return -1;
+    }
+    ALOGI("audio_session_id = %d\n", session_id);
+
     if (!opaque->abort_request && !opaque->pause_on)
         SDL_Android_AudioTrack_play(env, atrack);
 
@@ -160,7 +187,13 @@ static int aout_thread_n(JNIEnv *env, SDL_Aout *aout)
         }
         SDL_UnlockMutex(opaque->wakeup_mutex);
 
+        SDL_LockMutex(opaque->cblk_mutex);
+        if (opaque->abort_request) {
+            SDL_UnlockMutex(opaque->cblk_mutex);
+            break;
+        }
         audio_cblk(userdata, buffer, copy_size);
+        SDL_UnlockMutex(opaque->cblk_mutex);
         if (opaque->need_flush) {
             SDL_Android_AudioTrack_flush(env, atrack);
             opaque->need_flush = false;
@@ -213,6 +246,7 @@ static int aout_thread(void *arg)
         SDL_Aout_Opaque *opaque = aout->opaque;
         SDL_LockMutex(opaque->wakeup_mutex);
         opaque->loop_exited = true;
+        opaque->create_failed = true;   /* aout_open_audio_n 在等 AudioTrack 建好 */
         SDL_CondBroadcast(opaque->wakeup_cond);
         SDL_UnlockMutex(opaque->wakeup_mutex);
         return -1;
@@ -221,13 +255,25 @@ static int aout_thread(void *arg)
     return aout_thread_n(env, aout);
 }
 
+/*
+ * Java AudioTrack 改在音频线程上建，这里只算参数、起线程、等它建好。
+ *
+ * 建对象要和 audioserver 跨进程走一趟（真机 10~20ms）。以前在调用方（读线程补开音轨）里
+ * 同步建，换台时 stop 正好碰上就得干等它建完，全算进下一台。现在 stream_close 可以用
+ * aout_abort_open 叫停这次等待，读线程立刻返回；线程自己建完后看到 abort 就收尾。
+ */
 static int aout_open_audio_n(JNIEnv *env, SDL_Aout *aout, const SDL_AudioSpec *desired, SDL_AudioSpec *obtained)
 {
     assert(desired);
     SDL_Aout_Opaque *opaque = aout->opaque;
+    bool created, failed;
+
+    /* 已经被叫停，或者上一次被叫停的 open 留下的线程还没收尾 */
+    if (opaque->open_aborted || opaque->audio_tid)
+        return -1;
 
     opaque->spec = *desired;
-    opaque->atrack = SDL_Android_AudioTrack_new_from_sdl_spec(env, desired);
+    opaque->atrack = SDL_Android_AudioTrack_prepare_from_sdl_spec(env, desired);
     if (!opaque->atrack) {
         ALOGE("aout_open_audio_n: failed to new AudioTrcak()");
         return -1;
@@ -254,12 +300,11 @@ static int aout_open_audio_n(JNIEnv *env, SDL_Aout *aout, const SDL_AudioSpec *d
         SDLTRACE("audio target format fmt:0x%x, channel:0x%x", (int)obtained->format, (int)obtained->channels);
     }
 
-    opaque->audio_session_id = SDL_Android_AudioTrack_getAudioSessionId(env, opaque->atrack);
-    ALOGI("audio_session_id = %d\n", opaque->audio_session_id);
-
     opaque->pause_on = 1;
     opaque->abort_request = 0;
     opaque->loop_exited = false;
+    opaque->created = false;
+    opaque->create_failed = false;
     opaque->audio_tid = SDL_CreateThreadEx(&opaque->_audio_tid, aout_thread, aout, "ff_aout_android");
     if (!opaque->audio_tid) {
         ALOGE("aout_open_audio_n: failed to create audio thread");
@@ -268,6 +313,28 @@ static int aout_open_audio_n(JNIEnv *env, SDL_Aout *aout, const SDL_AudioSpec *d
         return -1;
     }
 
+    SDL_LockMutex(opaque->wakeup_mutex);
+    while (!opaque->created && !opaque->create_failed && !opaque->open_aborted)
+        SDL_CondWait(opaque->wakeup_cond, opaque->wakeup_mutex);
+    created = opaque->created;
+    failed = opaque->create_failed;
+    if (!created && !failed)
+        opaque->abort_request = true; /* 被叫停：线程建完后直接收尾，join 留给 close */
+    SDL_UnlockMutex(opaque->wakeup_mutex);
+
+    if (failed) {
+        SDL_WaitThread(opaque->audio_tid, NULL);
+        opaque->audio_tid = NULL;
+        if (opaque->atrack) {
+            SDL_Android_AudioTrack_free(env, opaque->atrack);
+            opaque->atrack = NULL;
+        }
+        return -1;
+    }
+    if (!created) {
+        ALOGI("aout_open_audio_n: aborted while the AudioTrack was being created\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -338,7 +405,11 @@ static void aout_close_audio(SDL_Aout *aout)
      * 全程持锁（等待时 cond 会放锁）：音频线程置 loop_exited 也要拿这把锁，置位之后才释放
      * AudioTrack，pause/stop 期间对象不会被释放。
      */
-    if (opaque->atrack && JNI_OK == SDL_JNI_SetupThreadEnv(&env))
+    /* 对象可能还在音频线程上建（open 被叫停的情况）：没建好就不碰，线程建完会自己看到 abort。
+       异步关闭（aout_free_async）先置了 abort，线程可能已经自己退出写循环、把 AudioTrack
+       交给后台释放了：loop_exited 已置位就不能再碰。持锁判断，线程置位要拿同一把锁。 */
+    if (opaque->created && !opaque->loop_exited && opaque->atrack &&
+        JNI_OK == SDL_JNI_SetupThreadEnv(&env))
         SDL_Android_AudioTrack_pause(env, opaque->atrack);
     else
         env = NULL;
@@ -379,9 +450,67 @@ static void aout_free_l(SDL_Aout *aout)
 
         SDL_DestroyCond(opaque->wakeup_cond);
         SDL_DestroyMutex(opaque->wakeup_mutex);
+        SDL_DestroyMutex(opaque->cblk_mutex);
     }
 
     SDL_Aout_FreeInternal(aout);
+}
+
+static void aout_abort_open(SDL_Aout *aout)
+{
+    SDL_Aout_Opaque *opaque = aout->opaque;
+
+    SDL_LockMutex(opaque->wakeup_mutex);
+    opaque->open_aborted = true;
+    SDL_CondBroadcast(opaque->wakeup_cond);
+    SDL_UnlockMutex(opaque->wakeup_mutex);
+}
+
+static void *aout_reaper_thread(void *arg)
+{
+    SDL_Aout *aout = arg;
+    JNIEnv *env = NULL;
+    Uint64 t0 = SDL_GetTickHR();
+    /* aout_close_audio 里打断 write 的 pause/stop 要用 JNI */
+    bool attached = JNI_OK == SDL_JNI_SetupThreadEnv(&env);
+
+    SDL_AoutFree(aout);
+    ALOGI("aout: background close done in %d ms\n", (int)(SDL_GetTickHR() - t0));
+    if (attached)
+        SDL_JNI_DetachThreadEnv();
+    return NULL;
+}
+
+/*
+ * 换台时 stream_close 用它代替同步关闭。同步关闭要打断阻塞的 write、等音频线程退出、
+ * 停掉 AudioTrack，真机上每次 11~16ms，全算进下一台。
+ *
+ * 这里只做必须同步的一步：叫停音频线程，并确认回调已经停下（拿一次 cblk_mutex），
+ * 之后它不会再读 ffp->is。其余（pause 打断 write、join、release）交给后台线程，
+ * 这个 aout 对象整个归后台线程，调用方要换一个新的（ffp_prepare_async_l 见 NULL 会新建）。
+ */
+static void aout_free_async(SDL_Aout *aout)
+{
+    SDL_Aout_Opaque *opaque = aout->opaque;
+    pthread_attr_t attr;
+    pthread_t tid;
+    int started = 0;
+
+    SDL_LockMutex(opaque->wakeup_mutex);
+    opaque->abort_request = true;
+    opaque->open_aborted = true;
+    SDL_CondBroadcast(opaque->wakeup_cond);
+    SDL_UnlockMutex(opaque->wakeup_mutex);
+    SDL_LockMutex(opaque->cblk_mutex);
+    SDL_UnlockMutex(opaque->cblk_mutex);
+
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        started = pthread_create(&tid, &attr, aout_reaper_thread, aout) == 0;
+        pthread_attr_destroy(&attr);
+    }
+    if (!started)
+        SDL_AoutFree(aout);
 }
 
 static void func_set_playback_rate(SDL_Aout *aout, float speed)
@@ -407,6 +536,7 @@ SDL_Aout *SDL_AoutAndroid_CreateForAudioTrack()
     SDL_Aout_Opaque *opaque = aout->opaque;
     opaque->wakeup_cond  = SDL_CreateCond();
     opaque->wakeup_mutex = SDL_CreateMutex();
+    opaque->cblk_mutex   = SDL_CreateMutex();
     opaque->speed        = 1.0f;
 
     aout->opaque_class = &g_audiotrack_class;
@@ -418,6 +548,8 @@ SDL_Aout *SDL_AoutAndroid_CreateForAudioTrack()
     aout->close_audio  = aout_close_audio;
     aout->func_get_audio_session_id = aout_get_audio_session_id;
     aout->func_set_playback_rate    = func_set_playback_rate;
+    aout->func_abort_open           = aout_abort_open;
+    aout->func_free_async           = aout_free_async;
 
     return aout;
 }

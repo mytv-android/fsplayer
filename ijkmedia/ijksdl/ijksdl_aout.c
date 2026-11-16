@@ -79,6 +79,21 @@ void SDL_AoutFreeP(SDL_Aout **paout)
     *paout = NULL;
 }
 
+void SDL_AoutAbortOpen(SDL_Aout *aout)
+{
+    if (aout && aout->func_abort_open)
+        aout->func_abort_open(aout);
+}
+
+void SDL_AoutFreeAsyncP(SDL_Aout **paout)
+{
+    if (!paout || !*paout || !(*paout)->func_free_async)
+        return;
+
+    (*paout)->func_free_async(*paout);
+    *paout = NULL;
+}
+
 double SDL_AoutGetLatencySeconds(SDL_Aout *aout)
 {
     if (!aout)

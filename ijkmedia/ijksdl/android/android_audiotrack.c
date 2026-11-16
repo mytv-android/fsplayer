@@ -147,7 +147,8 @@ void SDL_Android_AudioTrack_set_volume(JNIEnv *env, SDL_Android_AudioTrack *atra
     J4AC_AudioTrack__setStereoVolume__catchAll(env, atrack->thiz, left_volume, right_volume);
 }
 
-SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_Android_AudioTrack_Spec *spec)
+/* 只校验参数、算出目标格式和缓冲大小，不建 Java 对象（见 SDL_Android_AudioTrack_create） */
+static SDL_Android_AudioTrack *audiotrack_prepare(JNIEnv *env, SDL_Android_AudioTrack_Spec *spec)
 {
     assert(spec);
 
@@ -229,24 +230,28 @@ SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_An
     // for fast playback
     min_buffer_size *= AUDIOTRACK_PLAYBACK_MAXSPEED;
 
-    atrack->thiz = J4AC_AudioTrack__AudioTrack__asGlobalRef__catchAll(env, 
-        atrack->spec.stream_type,
-        atrack->spec.sample_rate_in_hz,
-        atrack->spec.channel_config,
-        atrack->spec.audio_format,
-        min_buffer_size,
-        atrack->spec.mode);
-    if (!atrack->thiz) {
-        free(atrack);
-        return NULL;
-    }
-
     atrack->min_buffer_size = min_buffer_size;
     atrack->spec.buffer_size_in_bytes = min_buffer_size;
     // atrack->max_volume = J4AC_AudioTrack__getMaxVolume__catchAll(env);
     // atrack->min_volume = J4AC_AudioTrack__getMinVolume__catchAll(env);
     atrack->max_volume = 1.0f;
     atrack->min_volume = 0.0f;
+
+    return atrack;
+}
+
+/* 建 Java AudioTrack：要和 audioserver 跨进程走一趟，真机上 10~20ms */
+int SDL_Android_AudioTrack_create(JNIEnv *env, SDL_Android_AudioTrack *atrack)
+{
+    atrack->thiz = J4AC_AudioTrack__AudioTrack__asGlobalRef__catchAll(env, 
+        atrack->spec.stream_type,
+        atrack->spec.sample_rate_in_hz,
+        atrack->spec.channel_config,
+        atrack->spec.audio_format,
+        atrack->min_buffer_size,
+        atrack->spec.mode);
+    if (!atrack->thiz)
+        return -1;
 
     // extra init
     float init_volume = 1.0f;
@@ -255,20 +260,44 @@ SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_An
     ALOGI("%s: init volume as %f/(%f,%f)", __func__, init_volume, atrack->min_volume, atrack->max_volume);
     J4AC_AudioTrack__setStereoVolume__catchAll(env, atrack->thiz, init_volume, init_volume);
 
+    return 0;
+}
+
+SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_Android_AudioTrack_Spec *spec)
+{
+    SDL_Android_AudioTrack *atrack = audiotrack_prepare(env, spec);
+    if (!atrack)
+        return NULL;
+    if (SDL_Android_AudioTrack_create(env, atrack) < 0) {
+        free(atrack);
+        return NULL;
+    }
     return atrack;
+}
+
+static void audiotrack_spec_from_sdl(SDL_Android_AudioTrack_Spec *atrack_spec, const SDL_AudioSpec *sdl_spec)
+{
+    SDL_Android_AudioTrack_get_default_spec(atrack_spec);
+    atrack_spec->sample_rate_in_hz = sdl_spec->freq;
+    atrack_spec->channel_config = find_android_channel(sdl_spec->channels);
+    atrack_spec->audio_format = find_android_format(sdl_spec->format);
+    atrack_spec->buffer_size_in_bytes = sdl_spec->size;
 }
 
 SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_sdl_spec(JNIEnv *env, const SDL_AudioSpec *sdl_spec)
 {
     SDL_Android_AudioTrack_Spec atrack_spec;
 
-    SDL_Android_AudioTrack_get_default_spec(&atrack_spec);
-    atrack_spec.sample_rate_in_hz = sdl_spec->freq;
-    atrack_spec.channel_config = find_android_channel(sdl_spec->channels);
-    atrack_spec.audio_format = find_android_format(sdl_spec->format);
-    atrack_spec.buffer_size_in_bytes = sdl_spec->size;
-
+    audiotrack_spec_from_sdl(&atrack_spec, sdl_spec);
     return SDL_Android_AudioTrack_new_from_spec(env, &atrack_spec);
+}
+
+SDL_Android_AudioTrack *SDL_Android_AudioTrack_prepare_from_sdl_spec(JNIEnv *env, const SDL_AudioSpec *sdl_spec)
+{
+    SDL_Android_AudioTrack_Spec atrack_spec;
+
+    audiotrack_spec_from_sdl(&atrack_spec, sdl_spec);
+    return audiotrack_prepare(env, &atrack_spec);
 }
 
 void SDL_Android_AudioTrack_free(JNIEnv *env, SDL_Android_AudioTrack* atrack)

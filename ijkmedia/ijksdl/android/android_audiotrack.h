@@ -96,6 +96,9 @@ typedef struct SDL_Android_AudioTrack SDL_Android_AudioTrack;
 
 SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_spec(JNIEnv *env, SDL_Android_AudioTrack_Spec *spec);
 SDL_Android_AudioTrack *SDL_Android_AudioTrack_new_from_sdl_spec(JNIEnv *env, const SDL_AudioSpec *sdl_spec);
+/* 分两步建：prepare 只算参数（目标格式、缓冲大小），create 才建 Java 对象 */
+SDL_Android_AudioTrack *SDL_Android_AudioTrack_prepare_from_sdl_spec(JNIEnv *env, const SDL_AudioSpec *sdl_spec);
+int SDL_Android_AudioTrack_create(JNIEnv *env, SDL_Android_AudioTrack *atrack);
 void SDL_Android_AudioTrack_free(JNIEnv *env, SDL_Android_AudioTrack* atrack);
 
 void SDL_Android_AudioTrack_get_target_spec(SDL_Android_AudioTrack* atrack, SDL_AudioSpec *spec);
